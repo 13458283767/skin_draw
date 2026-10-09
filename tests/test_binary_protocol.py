@@ -199,16 +199,16 @@ def test_explicit_format_modes():
 def test_mixed_stream_fourteen_blocks_calibrates_then_filters_and_draws(app, mode):
     clock, stop = FakeClock(), Event()
     chunks = [NOT_READY]
-    for sequence in range(31):
+    for sequence in range(1, 95):
         for key in range(1, 15):
-            values = [[2500, 2500], [2500, 2500]] if sequence < 30 else [[2000, 1000], [2000, 2200]]
+            values = [[2500, 2500], [2500, 2500]] if sequence <= 59 else [[2000, 1000], [2000, 2200]]
             chunks.append((binary if key % 2 else text)(key, values))
     port = StreamPort(b"".join(chunks), clock, chunk=37)
-    buffer = LiveBuffer(calibration_seconds=0, clock=clock)
+    buffer = LiveBuffer(clock=clock, calib_n=30, norm="A")
 
     def receive(block):
         buffer.receive(block)
-        if buffer.sequence == 14 * 31:
+        if buffer.sequence == 14 * 94:
             stop.set()
 
     reader = SerialAcquisition("FAKE", stop, lambda scan: buffer.finish_scan(scan, False),
@@ -216,7 +216,7 @@ def test_mixed_stream_fourteen_blocks_calibrates_then_filters_and_draws(app, mod
                                mode=mode, on_block=receive)
     reader.run()
     snapshot = buffer.take()
-    assert snapshot.calibration.counts == dict.fromkeys(range(1, 15), 30)
+    assert snapshot.preprocess.samples == dict.fromkeys(range(1, 15), 30)
     assert not port.commands and port.closed
     assert reader.active_mode == "stream"
     window = MainWindow()
@@ -224,7 +224,7 @@ def test_mixed_stream_fourteen_blocks_calibrates_then_filters_and_draws(app, mod
         window._consume_scan(snapshot.scan, snapshot)
         assert len(window.heatmap.items) == 14
         for item in window.heatmap.items.values():
-            np.testing.assert_array_equal(item.values, [[0, 0], [500, 300]])
+            np.testing.assert_array_equal(item.values, [[500, 1500], [500, 300]])
     finally:
         window.close()
         window.deleteLater()
@@ -263,12 +263,12 @@ def test_polling_keeps_not_ready_device_and_retries_with_unchanged_command():
 
 def test_bad_tail_does_not_count_as_calibration_sample():
     parser = SerialBlockParser()
-    buffer = LiveBuffer(calibration_seconds=0)
+    buffer = LiveBuffer(calib_n=30, norm="A")
     packet = binary(1, [[2500]])
-    for block in parser.feed(packet * 29 + packet[:-1] + b"\x00"):
+    for block in parser.feed(packet * 58 + packet[:-1] + b"\x00"):
         buffer.receive(block)
-    assert buffer.calibration.counts == {1: 29}
-    assert not buffer.calibration.ready
+    assert buffer.preprocessors[1].samples == 29
+    assert not buffer.preprocessors[1].ready
     for block in parser.feed(packet):
         buffer.receive(block)
-    assert buffer.calibration.ready
+    assert buffer.preprocessors[1].ready

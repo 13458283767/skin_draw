@@ -61,6 +61,24 @@ def test_missing_frame_clears_old_values_and_bad_frame_is_atomic(window):
     assert window.heatmap.frame is frame
 
 
+def test_not_ready_nan_points_are_gray_but_bad_values_are_rejected(window):
+    frame = Frame((Block(1, [[2500, 0]]),))
+    window.heatmap.set_frame(frame, {1: np.array([[2500., np.nan]])})
+    item = window.heatmap.items[1]
+    assert tuple(item.colors[0, 0]) != MISSING_COLOR
+    assert tuple(item.colors[0, 1]) == MISSING_COLOR
+    assert window.heatmap.reading((1, 0, 0)).value == 2500
+    assert window.heatmap.reading((1, 0, 1)).value is None  # not-ready point reports no value
+    base = np.full((1, 2), 2500.)
+    for bad in (np.inf, -1., 4096.):
+        broken = base.copy()
+        broken[0, 1] = bad
+        with pytest.raises(ValueError):
+            window.heatmap.set_frame(frame, {1: broken})
+    # A rejected frame must not replace the previously displayed values.
+    assert np.isnan(window.heatmap.items[1].values[0, 1])
+
+
 def test_rotation_readout_and_selection_updates(window):
     window.heatmap.set_layout((BlockLayout(1, 2, 3, rotation=90, flip_x=True),))
     window.present_frame(Frame((Block(1, [[10, 20, 30], [40, 50, 60]]),)))

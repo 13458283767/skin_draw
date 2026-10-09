@@ -205,7 +205,7 @@ class SerialAcquisition:
         try:
             serial_port = self.factory(self.port)
             self.diagnostics.log(logging.INFO, "串口打开成功")
-            self.on_status(f"串口已打开 · {self.baudrate} bps，请保持无按压，各行采集约1秒且至少30个有效样本")
+            self.on_status(f"串口已打开 · {self.baudrate} bps，请保持无按压，约3秒自动标定")
             mode = self.mode
             initial = ()
             if mode == "auto":

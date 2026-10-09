@@ -150,19 +150,18 @@ def test_poll_timeout_recovery_and_manual_stop_not_reported_as_disconnect(caplog
     assert "轮询应答超时" not in caplog.text
 
 
-def test_baseline_and_adc_filter_events_do_not_log_every_frame(caplog):
+def test_preprocess_events_do_not_log_every_frame(caplog):
     caplog.set_level(logging.INFO, logger="skin_draw")
     clock = FakeClock()
-    buffer = LiveBuffer(calibration_seconds=0, clock=clock)
-    for _ in range(30):
+    buffer = LiveBuffer(calib_n=30, norm="A", clock=clock)
+    for _ in range(130):
         buffer.receive(Block(1, [[2500, 2500]]))
-    assert caplog.text.count("稳定基线校准完成") == 1
+    assert caplog.text.count("皮肤块预处理已启动") == 1
+    assert '"block_id": 1' in caplog.text
     for _ in range(100):
         buffer.receive(Block(1, [[1000, 2300]]))
-    assert caplog.text.count("ADC异常行已过滤") == 1
-    assert '"raw_rows": [[1000, 2300]]' in caplog.text
-    assert '"held_rows": [[2500, 2500]]' in caplog.text
-    assert buffer.outlier_filter.rejected_counts == {1: 200}
+    assert caplog.text.count("皮肤块预处理已启动") == 1  # 启动后每帧不再记录
+    assert buffer.preprocessors[1].samples == 30
 
 
 def test_logs_button_opens_resolved_directory(app, tmp_path, monkeypatch):

@@ -40,5 +40,11 @@ class ColorScale:
 
     def map_values(self, values: np.ndarray) -> np.ndarray:
         # Clipping affects colors only, never the underlying ADC values.
+        # NaN marks not-ready points and empty cells: paint them as missing.
         normalized = np.clip((values.astype(float) - self.low) / (self.high - self.low), 0, 1)
-        return lookup_table(self.palette)[np.rint(normalized * 255).astype(int)]
+        missing = ~np.isfinite(normalized)
+        colors = lookup_table(self.palette)[np.rint(np.where(missing, 0, normalized) * 255).astype(int)]
+        if missing.any():
+            colors = np.array(colors, copy=True)
+            colors[missing] = MISSING_COLOR
+        return colors

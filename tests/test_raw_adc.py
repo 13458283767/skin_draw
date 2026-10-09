@@ -16,9 +16,7 @@ def test_raw_pipeline_skips_calibration_and_filter_for_text_and_binary(monkeypat
     def forbidden(*args, **kwargs):
         raise AssertionError("Raw mode must not calibrate, subtract, or filter")
 
-    monkeypatch.setattr(buffer.calibration, "consume", forbidden)
-    monkeypatch.setattr(buffer.calibration, "project", forbidden)
-    monkeypatch.setattr(buffer.outlier_filter, "process", forbidden)
+    monkeypatch.setattr(buffer, "_preprocessor", forbidden)
     parser = SerialBlockParser()
     packets = [b"BLOCK_7,1,3:\r\n2500,2490,2510\r\n",
                bytes.fromhex("AA 07 01 03 02 30 00 00 0F FF 0A"),
@@ -32,10 +30,10 @@ def test_raw_pipeline_skips_calibration_and_filter_for_text_and_binary(monkeypat
         buffer.receive(decoded[0])
         snapshot = buffer.take()
         assert snapshot.received_blocks == sequence
-        np.testing.assert_array_equal(snapshot.display_values[7], decoded[0].values)
-        assert snapshot.display_frame.blocks[0] is decoded[0]
-        assert not snapshot.filtered_counts and not snapshot.filtered_masks
-        assert not snapshot.calibration.baseline and not snapshot.calibration.counts
+        assert snapshot.display_values[7] is decoded[0].values
+        assert snapshot.scan.frame.blocks[0] is decoded[0]
+        assert not buffer.preprocessors
+        assert snapshot.preprocess.message == "原始 ADC 模式 · 不扣基线"
 
 
 def test_raw_mask_shape_and_freshness_keep_original_values():
@@ -44,7 +42,7 @@ def test_raw_mask_shape_and_freshness_keep_original_values():
     first = Block(1, [[2500, 0]])
     buffer.receive(first)
     buffer.set_sensor_masks(SensorMasks().with_mask(1, [[True, False]]), 1)
-    buffer.reset_calibration()
+    buffer.reset_preprocessing()
     buffer.set_direction(1)
     assert buffer.take().display_values[1] is first.values
     second = Block(1, [[500], [2600]])
@@ -54,7 +52,7 @@ def test_raw_mask_shape_and_freshness_keep_original_values():
     snapshot = buffer.take()
     assert snapshot.display_values[1] is second.values
     assert set(snapshot.display_values) == {1, 14}
-    assert not snapshot.calibration.rows
+    assert not buffer.preprocessors
     now[0] = 5.
     stale = buffer.take()
     assert not stale.scan.frame.blocks
@@ -89,7 +87,7 @@ def test_raw_gui_first_frame_values_statistics_masks_and_orientation(app, tmp_pa
         window._recalibrate()
         window._toggle_direction()
         assert window.heatmap.reading((1, 1, 1)).value == 560
-        assert not window.calibration.baseline
+        assert window.preprocess is None
     finally:
         window.close()
         window.deleteLater()
@@ -120,7 +118,7 @@ def test_raw_worker_connect_disconnect_reconnect_never_waits_for_baseline(app, m
                 if window.current_frame.sequence == 2:
                     break
             assert window.worker.buffer.raw_adc
-            assert not window.calibration.baseline
+            assert window.preprocess is not None and window.preprocess.baselines == {}
             assert window.heatmap.reading((4, 0, 0)).value == 1196
             assert window.controls.high.value() == 4095
             assert not window.controls.auto_levels.isChecked()

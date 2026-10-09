@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from collections import deque
+from dataclasses import replace
 from math import ceil
 import logging
 
@@ -16,7 +17,6 @@ from ..colors import ColorScale
 from ..acquisition import Scan
 from ..models import Frame
 from ..mapping import BlockOrientation
-from ..processing import BaselineCalibration
 from ..sensor_masks import SensorMasks, default_mask_path
 from ..transport import available_ports
 from ..simulator import demo_specs, generate_frame
@@ -57,8 +57,7 @@ class MainWindow(QMainWindow):
         self.current_frame: Frame | None = None
         self.source_specs = demo_specs()
         self.input_source = "idle"
-        self.calibration = BaselineCalibration(30)
-        self.calibration.sensor_masks = self.sensor_masks
+        self.preprocess = None  # latest PreprocessState from the worker
         self.worker: SerialWorker | None = None
         self.accept_scans = False
         self.close_when_stopped = False
@@ -68,12 +67,9 @@ class MainWindow(QMainWindow):
         self.gui_refreshes = 0
         self.gui_update_times = deque(maxlen=1024)
         self.gui_sample_ages = deque(maxlen=1024)
-        self.last_filtered_counts = {}
         self.display_values = None
         self.live_blocks = {}  # observed shapes for this connection, not fresh measurements
         self.live_missing_counts = None
-        self.live_display_frame = None
-        self.live_filtered_masks = {}
         self.pending_live_info = None
         self.live_info_state = None
         self.unit = "ADC"
@@ -192,6 +188,8 @@ class MainWindow(QMainWindow):
         controls.connect_button.clicked.connect(self._connect_hardware)
         controls.recalibrate.clicked.connect(self._recalibrate)
         controls.direction.clicked.connect(self._toggle_direction)
+        controls.normalize.toggled.connect(self._norm_changed)
+        controls.norm_mode.currentIndexChanged.connect(self._norm_mode_changed)
         controls.reset_positions.clicked.connect(self.heatmap.reset_positions)
         controls.body_positions.clicked.connect(self.heatmap.restore_body_positions)
         controls.orientation_block.currentIndexChanged.connect(self._orientation_target_changed)
@@ -302,10 +300,7 @@ class MainWindow(QMainWindow):
         changed = not np.array_equal(self.sensor_masks.get(block_id, np.asarray(mask).shape), mask)
         updated.save(self.mask_path)
         self.sensor_masks = updated
-        self.calibration.sensor_masks = updated
         if changed:
-            self.calibration.reset_block(block_id)
-            self.live_filtered_masks.pop(block_id, None)
             self.pending_live_info = None
             self.live_info_state = None
             if self.worker is not None:
@@ -313,9 +308,10 @@ class MainWindow(QMainWindow):
                 self._request_live_update()
             if self.display_values is not None and not self.raw_adc:
                 self.display_values = {key: value for key, value in self.display_values.items() if key != block_id}
-            if self.unit == "ΔADC":
-                self.controls.calibration_progress.setValue(self.calibration.progress)
-                self.controls.calibration_status.setText(f"BLOCK {block_id:02d} 点位已更新，请保持无按压，各行重新采集约1秒且至少30个有效样本")
+            if not self.raw_adc:
+                self.controls.calibration_progress.setValue(0)
+                self.controls.calibration_status.setText(
+                    f"BLOCK {block_id:02d} 点位已更新，请保持无按压，该块重新自动标定（约3秒）")
                 self.controls.calibration_details.hide()
         elif self.worker is not None:
             # Same effective mask requires no recalibration.
@@ -354,22 +350,26 @@ class MainWindow(QMainWindow):
 
     def _display_frame(self, frame: Frame, display_values=None, *, changed_ids=None, refresh_statistics=True):
         layout_blocks = tuple(self.live_blocks.values()) if self.input_source in ("hardware", "stopped") else None
+        # Cache before set_frame: the heatmap re-emits the selected reading
+        # while refreshing, and the detail panel reads this cache.
+        self.display_values = display_values
         self.heatmap.set_frame(frame, display_values, layout_blocks,
                                self.live_missing_counts if layout_blocks is not None else None,
                                changed_ids=changed_ids)
         self.current_frame = frame
-        self.display_values = display_values
         if refresh_statistics:
             self._refresh_statistics()
         if self.controls.auto_levels.isChecked():
             self._update_scale()
 
     def _refresh_statistics(self):
+        # Not-ready points and empty cells are NaN: skip them in every statistic.
         arrays = self._active_arrays()
         values = np.concatenate([array.ravel() for array in arrays]) if arrays else np.array([])
-        for widget, value in ((self.min_label, f"{values.min():.0f}" if values.size else "—"),
-                              (self.max_label, f"{values.max():.0f}" if values.size else "—"),
-                              (self.mean_label, f"{values.mean():.1f}" if values.size else "—")):
+        finite = values[np.isfinite(values)] if values.size else values
+        for widget, value in ((self.min_label, f"{finite.min():.0f}" if finite.size else "—"),
+                              (self.max_label, f"{finite.max():.0f}" if finite.size else "—"),
+                              (self.mean_label, f"{finite.mean():.1f}" if finite.size else "—")):
             widget.setText(value)
         self._update_status()
 
@@ -440,10 +440,12 @@ class MainWindow(QMainWindow):
         low, high = self.controls.low.value(), self.controls.high.value()
         arrays = self._active_arrays()
         if self.controls.auto_levels.isChecked() and arrays:
-            low = min(float(array.min()) for array in arrays)
-            high = max(float(array.max()) for array in arrays)
-            if low == high:
-                low, high = max(0, low - 1), min(4095, high + 1)
+            parts = [part for part in (array[np.isfinite(array)] for array in arrays) if part.size]
+            if parts:
+                low = min(float(part.min()) for part in parts)
+                high = max(float(part.max()) for part in parts)
+                if low == high:
+                    low, high = max(0, low - 1), min(4095, high + 1)
         self.heatmap.set_scale(ColorScale(low, high, self.controls.palette.currentText()))
 
     def _update_status(self):
@@ -455,8 +457,14 @@ class MainWindow(QMainWindow):
         elif self.input_source == "idle":
             state = "未连接硬件"
         elif self.input_source == "hardware":
-            state = ("实时原始 ADC · 不校准 / 不过滤" if self.raw_adc else
-                     "实时采集" if self.calibration.ready else f"无按压校准 {self.calibration.progress}%")
+            if self.raw_adc:
+                state = "实时原始 ADC · 不校准 / 不过滤"
+            elif self.preprocess is None:
+                state = "实时采集"
+            elif self.preprocess.ready:
+                state = "实时采集"
+            else:
+                state = f"自动标定 {self.preprocess.progress}%"
             if self.last_scan and not self.last_scan.complete:
                 state += " · 本轮缺块"
         elif self.input_source == "stopped":
@@ -468,11 +476,9 @@ class MainWindow(QMainWindow):
         if reading is None:
             self.hover_label.setText("单击选点，按住皮肤块拖动；橙色虚线表示本块暂未更新。")
         else:
-            value = "等待校准或无显示数据" if reading.value is None else f"{reading.value:g} {self.unit}"
+            value = "自动标定中或无显示数据" if reading.value is None else f"{reading.value:g} {self.unit}"
             if self.heatmap.items[reading.block_id].stale:
                 value = "本块暂未更新（非实时）"
-            elif self._reading_filtered(reading):
-                value += " · 异常值已过滤，保持上一有效值"
             self.hover_label.setText(f"BLOCK {reading.block_id:02d}   /   原始行 {reading.row + 1} · 列 {reading.col + 1}   /   {value}")
 
     def _selected(self, reading: SensorReading | None):
@@ -487,19 +493,36 @@ class MainWindow(QMainWindow):
             self.selected_detail.setText("尚未选点    ·    拖动皮肤块移动 / 拖动空白平移 / 滚轮缩放 / F 适应窗口")
         else:
             self.selected_detail.setText(f"已锁定 BLOCK {reading.block_id:02d} · 原始行 {reading.row + 1} / 列 {reading.col + 1}    ·    单击其他方块切换，单击空白取消")
-            if reading.block_id in self.calibration.baseline and self.unit == "ΔADC" and self.heatmap.frame:
-                raw = next((b for b in self.heatmap.frame.blocks if b.block_id == reading.block_id), None)
-                baseline = self.calibration.baseline.get(reading.block_id)
-                if raw is not None and baseline is not None:
-                    adc = int(raw.values[reading.row, reading.col])
-                    base = float(baseline[reading.row, reading.col])
-                    self.selected_detail.setText(f"BLOCK {reading.block_id:02d} · 行 {reading.row + 1}/列 {reading.col + 1}   原始 ADC {adc}   基线 {base:.1f}   当前−基线 {adc-base:+.1f}")
-                    if self._reading_filtered(reading):
-                        self.selected_detail.setText(f"BLOCK {reading.block_id:02d} · 行 {reading.row + 1}/列 {reading.col + 1}   原始 ADC {adc}（异常值已过滤）   显示保持上一有效值")
+            self._show_selected_detail(reading)
 
-    def _reading_filtered(self, reading):
-        mask = self.live_filtered_masks.get(reading.block_id) if self.input_source in ("hardware", "stopped") else None
-        return mask is not None and reading.row < mask.shape[0] and reading.col < mask.shape[1] and bool(mask[reading.row, reading.col])
+    def _show_selected_detail(self, reading: SensorReading):
+        # 原始 ADC 与基线来自点击时刻的快照；显示值按当前归一化模式裁剪。
+        if self.heatmap.frame is None or not self._at_sensor(reading):
+            return
+        raw = next((b for b in self.heatmap.frame.blocks if b.block_id == reading.block_id), None)
+        state = self.preprocess
+        if raw is None or state is None:
+            return
+        parts = [f"BLOCK {reading.block_id:02d} · 行 {reading.row + 1}/列 {reading.col + 1}",
+                 f"原始 ADC {int(raw.values[reading.row, reading.col])}"]
+        shown = (self.display_values or {}).get(reading.block_id)
+        shown = None if shown is None else float(shown[reading.row, reading.col])
+        baseline = state.baselines.get(reading.block_id)
+        base = None if baseline is None else float(baseline[reading.row, reading.col])
+        if state.norm == "none":
+            if shown is not None and np.isfinite(shown):
+                parts.append(f"滤波 {shown:.1f}")
+        else:
+            if base is not None and np.isfinite(base):
+                parts.append(f"基线 {base:.1f}")
+            if shown is not None and np.isfinite(shown):
+                parts.append(f"偏差 {shown:.1f}" if state.norm == "A" else f"归一 {shown:.2f}")
+        if len(parts) > 2:
+            self.selected_detail.setText("   ".join(parts))
+
+    def _at_sensor(self, reading):
+        block = next((b for b in self.heatmap.frame.blocks if b.block_id == reading.block_id), None)
+        return block is not None and reading.row < block.values.shape[0] and reading.col < block.values.shape[1]
 
     def _set_unit(self, unit):
         if self.unit == unit:
@@ -536,10 +559,8 @@ class MainWindow(QMainWindow):
         self.live_info_state = None
         self.controls.demo_panel.setVisible(enabled)
         self.controls.recalibrate.setEnabled(False)
-        self.calibration.reset()
+        self.preprocess = None
         self.live_blocks.clear()
-        self.live_display_frame = None
-        self.live_filtered_masks = {}
         self.live_missing_counts = None
         self.controls.calibration_progress.setValue(0)
         self.controls.calibration_details.hide()
@@ -552,7 +573,7 @@ class MainWindow(QMainWindow):
             self.input_source = "idle"
             self.source_badge.setText("等待连接硬件")
             self.controls.calibration_status.setText("收到首帧立即绘图，无需校准。" if self.raw_adc else
-                                                     "连接后保持无按压，各行采集约1秒且至少30个有效样本")
+                                                     "连接后保持无按压，约3秒自动标定完成")
             self._display_frame(Frame(()))
 
     def _connect_hardware(self):
@@ -581,32 +602,36 @@ class MainWindow(QMainWindow):
         self.gui_refreshes = 0
         self.gui_update_times.clear()
         self.gui_sample_ages.clear()
-        self.last_filtered_counts = {}
         self.pending_live_info = None
         self.live_info_state = None
         self.controls.demo_toggle.setChecked(False)
         self.timer.stop()
-        self.calibration.reset()
+        direction = self.preprocess.direction if self.preprocess is not None else -1
+        self.preprocess = None
         self.live_blocks.clear()
-        self.live_display_frame = None
-        self.live_filtered_masks = {}
         self.live_missing_counts = None
         self.last_scan = None
         self.input_source = "hardware"
-        self._set_unit("ADC" if self.raw_adc else "ΔADC")
         self.controls.auto_levels.setChecked(False)
-        self.controls.low.setValue(0)
-        self.controls.high.setValue(4095 if self.raw_adc else 1000)
         self.controls.palette.setCurrentText("蓝青黄红" if self.raw_adc else "浅红深红")
+        if self.raw_adc:
+            self._set_unit("ADC")
+            self.controls.low.setValue(0)
+            self.controls.high.setValue(4095)
+        else:
+            self.controls.normalize.setEnabled(True)
+            self.controls.norm_mode.setEnabled(self.controls.normalize.isChecked())
+            self._norm_applied()
         self.controls.calibration_progress.setValue(0)
-        self.controls.calibration_status.setText("等待原始 ADC，收到首帧立即绘图" if self.raw_adc else "检测设备中，请保持无按压")
+        self.controls.calibration_status.setText("等待原始 ADC，收到首帧立即绘图" if self.raw_adc else "检测设备中，请保持无按压，约3秒自动标定")
         self.controls.calibration_details.hide()
         self.source_badge.setText("连接并检测硬件")
         self._display_frame(Frame(()), {})
         self.worker = SerialWorker(port, self, mode=self.controls.receive_mode.currentData(),
-                                   direction=self.calibration.direction,
+                                   direction=direction,
                                    protocol=self.controls.protocol.currentData(),
-                                   baudrate=self.controls.baudrate.currentData(), raw_adc=self.raw_adc)
+                                   baudrate=self.controls.baudrate.currentData(),
+                                   raw_adc=self.raw_adc, norm=self._active_norm())
         self.worker.buffer.set_sensor_masks(self.sensor_masks)
         self.worker.status_changed.connect(self._serial_status)
         self.worker.failed.connect(self._serial_failed)
@@ -651,17 +676,16 @@ class MainWindow(QMainWindow):
                 self.gui_update_times.append((finished - now) * 1000)
                 if snapshot.received_blocks > previous_sequence:
                     self.gui_sample_ages.append(max(0., finished - snapshot.latest_received_at) * 1000)
-                self.last_filtered_counts = snapshot.filtered_counts
                 self.gui_refreshes += 1
             if now - self.last_gui_log >= 5:
+                state = self.preprocess
                 event(logger, logging.INFO, "界面刷新统计", rendered_snapshots=self.gui_refreshes,
-                      display_mode="raw_adc" if self.raw_adc else "calibrated",
+                      display_mode="raw_adc" if self.raw_adc else "preprocessed",
                       sequence=self.current_frame.sequence if self.current_frame else 0,
-                      calibration_counts=self.calibration.counts,
-                      calibration_progress=self.calibration.progress,
-                      calibration_pending_rows=self.calibration.pending_rows,
-                      calibration_details=self.calibration.progress_details if not self.raw_adc and not self.calibration.ready else None,
-                      filtered_points=self.last_filtered_counts,
+                      preprocess_ready=state.ready if state else None,
+                      preprocess_progress=state.progress if state else None,
+                      preprocess_norm=state.norm if state else None,
+                      calibration_samples=dict(state.samples) if state else None,
                       update_ms_p95=round(float(np.percentile(self.gui_update_times, 95)), 3) if self.gui_update_times else None,
                       update_ms_max=round(max(self.gui_update_times), 3) if self.gui_update_times else None,
                       latest_sample_age_ms_p95=round(float(np.percentile(self.gui_sample_ages, 95)), 3) if self.gui_sample_ages else None)
@@ -677,33 +701,33 @@ class MainWindow(QMainWindow):
     def _consume_scan(self, scan: Scan, snapshot=None):
         self.last_scan = scan
         self.input_source = "hardware"
-        self._set_unit("ADC" if self.raw_adc else "ΔADC")
         changed_ids = None
         if snapshot is None:
-            self.live_display_frame = None
-            self.live_filtered_masks = {}
+            # Direct injection without a worker: no preprocessing chain exists,
+            # so the raw frame is displayed as-is.
             self.live_missing_counts = None
             self.live_blocks = {key: block for key, block in self.live_blocks.items() if key in scan.expected_ids}
             self.live_blocks.update({block.block_id: block for block in scan.frame.blocks})
-            values = ({block.block_id: block.values for block in scan.frame.blocks} if self.raw_adc else
-                      self.calibration.consume(scan.frame, scan.expected_ids))
+            self._set_unit("ADC")
+            values = None
+            state = (scan.expected_ids, tuple(b.block_id for b in scan.frame.blocks), bool(scan.protocol_errors))
         else:
-            self.live_display_frame = snapshot.display_frame
-            self.live_filtered_masks = snapshot.filtered_masks
             self.live_blocks = {block.block_id: block for block in snapshot.layout_blocks}
             self.live_missing_counts = snapshot.missing_counts
-            self.calibration = snapshot.calibration
+            self.preprocess = snapshot.preprocess
             values = snapshot.display_values
             previous = self.display_values or {}
             changed_ids = {key for key in previous.keys() | values.keys()
                            if previous.get(key) is not values.get(key)}
-        # Calibration/device/missing state transitions remain immediate;
-        # continuously changing rates and statistics can update at 5 Hz.
-        state = (scan.expected_ids, tuple(sorted(self.calibration.counts.items())),
-                 tuple(sorted(self.calibration.baseline)), self.calibration.direction,
-                 tuple(b.block_id for b in scan.frame.blocks),
-                 tuple(sorted(snapshot.missing_counts.items())) if snapshot is not None else (),
-                 bool(scan.protocol_errors))
+            # Preprocessing/device/missing state transitions remain immediate;
+            # continuously changing rates and statistics can update at 5 Hz.
+            state = (scan.expected_ids,
+                     tuple(b.block_id for b in scan.frame.blocks),
+                     tuple(sorted(snapshot.missing_counts.items())),
+                     snapshot.preprocess.ready, snapshot.preprocess.progress,
+                     snapshot.preprocess.norm, snapshot.preprocess.direction,
+                     tuple(sorted(snapshot.preprocess.samples.items())),
+                     bool(scan.protocol_errors))
         refresh_info = snapshot is None or state != self.live_info_state
         self.live_info_state = state
         self.pending_live_info = (scan, snapshot)
@@ -720,27 +744,34 @@ class MainWindow(QMainWindow):
             self._refresh_statistics()
 
     def _update_live_info(self, scan, snapshot):
+        state = snapshot.preprocess if snapshot is not None else None
         if self.raw_adc:
             self.controls.calibration_status.setText("直接显示原始 ADC · 不扣基线 · 不过滤跳变")
             self.source_badge.setText("实时原始 ADC")
-        else:
-            self.controls.calibration_progress.setValue(self.calibration.progress)
-            self.controls.calibration_progress.setToolTip(self.calibration.progress_details)
-            self.controls.calibration_status.setText(self.calibration.message)
-            self.controls.calibration_details.setText(self.calibration.pending_summary)
-            self.controls.calibration_details.setToolTip(self.calibration.progress_details)
-            self.controls.calibration_details.setVisible(bool(self.calibration.pending_rows))
+        elif state is not None:
+            self._set_unit({"B": "归一化", "A": "ΔADC", "none": "ADC"}[state.norm])
+            self.controls.calibration_progress.setValue(state.progress)
+            pending = {key: count for key, count in sorted(state.samples.items()) if count < state.target}
+            self.controls.calibration_status.setText(state.message)
+            if state.ready or not pending:
+                self.controls.calibration_progress.setToolTip("")
+                self.controls.calibration_details.hide()
+                self.controls.calibration_details.setToolTip("")
+            else:
+                self.controls.calibration_progress.setToolTip(
+                    f"标定样本最少 {min(state.samples.values())}/{state.target}（慢跟踪基线）")
+                self.controls.calibration_details.setText(" · ".join(
+                    f"BLOCK {key:02d} {count}/{state.target}" for key, count in pending.items()))
+                self.controls.calibration_details.setToolTip("标定完成后基线仍会约每秒用中位数微调（慢跟踪）")
+                self.controls.calibration_details.setVisible(True)
             self.controls.recalibrate.setEnabled(True)
-            self.source_badge.setText("实时按压热力图" if self.calibration.ready else f"校准 {len(self.calibration.baseline)}/{len(scan.expected_ids)} 块")
+            self.source_badge.setText("实时按压热力图" if state.ready else f"自动标定 {state.progress}%")
         missing = sorted(set(scan.expected_ids) - {b.block_id for b in scan.frame.blocks})
         if not scan.frame.blocks:
             self.source_badge.setText("等待数据 · 画面非实时")
         detail = f"本轮 {scan.elapsed:.2f} 秒 · {len(scan.frame.blocks)}/{len(scan.expected_ids)} 块"
         if snapshot is not None:
             detail = f"累计 {snapshot.received_blocks} 个 BLOCK · 帧率见热力图上方"
-            filtered = sum(snapshot.filtered_counts.values())
-            if filtered:
-                detail += f" · 已过滤异常 {filtered} 点次"
         if missing:
             detail += " · 缺失 " + ",".join(map(str, missing))
         if scan.protocol_errors:
@@ -782,7 +813,10 @@ class MainWindow(QMainWindow):
                        self.controls.receive_mode, self.controls.protocol, self.controls.baudrate):
             widget.setEnabled(True)
         self.controls.recalibrate.setEnabled(False)
-        self.controls.calibration_status.setText("已断开；下次连接直接显示原始 ADC" if self.raw_adc else "已断开；下次连接将重新采集稳定基线")
+        if not self.raw_adc:
+            self.controls.normalize.setEnabled(False)
+            self.controls.norm_mode.setEnabled(False)
+        self.controls.calibration_status.setText("已断开；下次连接直接显示原始 ADC" if self.raw_adc else "已断开；下次连接将重新自动标定")
         self.controls.calibration_details.hide()
         self._update_status()
         if worker:
@@ -795,16 +829,16 @@ class MainWindow(QMainWindow):
             return
         self.pending_live_info = None
         self.live_info_state = None
-        logger.info("用户点击重新校准基线")
+        logger.info("用户点击重置滤波与基线")
         if self.worker is not None:
-            self.worker.buffer.reset_calibration()
+            self.worker.buffer.reset_preprocessing()
             self._request_live_update()
-        self.calibration.reset()
+        self.preprocess = None
         self.controls.calibration_progress.setValue(0)
         self.controls.calibration_progress.setToolTip("")
         self.controls.calibration_details.hide()
-        self.controls.calibration_status.setText("请松开传感器，各行重新采集约1秒且至少30个有效样本")
-        self.source_badge.setText("重新校准 0%")
+        self.controls.calibration_status.setText("请松开传感器，重新采集约3秒无按压样本")
+        self.source_badge.setText("自动标定 0%")
         if self.current_frame:
             self._display_frame(self.current_frame, {})
 
@@ -813,15 +847,66 @@ class MainWindow(QMainWindow):
             return
         self.pending_live_info = None
         self.live_info_state = None
-        logger.info("用户切换受压方向，目标 direction=%s", -self.calibration.direction)
-        self.calibration.set_direction(-self.calibration.direction)
+        current = self.preprocess.direction if self.preprocess is not None else -1
+        direction = -current
+        logger.info("用户切换受压方向，目标 direction=%s", direction)
+        if self.preprocess is not None:
+            self.preprocess = replace(self.preprocess, direction=direction)
         if self.worker is not None:
-            self.worker.buffer.set_direction(self.calibration.direction)
+            self.worker.buffer.set_direction(direction)
             self._request_live_update()
-        self.controls.direction.setText("受压变小 ↓  · 点击切换" if self.calibration.direction == -1 else "受压变大 ↑  · 点击切换")
-        if self.unit == "ΔADC" and self.current_frame:
-            display_frame = self.live_display_frame if self.input_source in ("hardware", "stopped") else None
-            self._display_frame(self.current_frame, self.calibration.project(display_frame or self.current_frame))
+        self.controls.direction.setText("受压变小 ↓  · 点击切换" if direction == -1 else "受压变大 ↑  · 点击切换")
+
+    def _active_norm(self):
+        """Current normalization mode from the two controls (B 为默认推荐)."""
+        if self.raw_adc or not self.controls.normalize.isChecked():
+            return "none"
+        return self.controls.norm_mode.currentData()
+
+    def _norm_applied(self):
+        """Unit, scale bounds and widget states for the active normalization mode."""
+        norm = self._active_norm()
+        self.controls.auto_levels.setChecked(False)
+        if norm == "B":
+            self._set_unit("归一化")
+            self.controls.low.setValue(0)
+            self.controls.high.setValue(1)
+        elif norm == "A":
+            self._set_unit("ΔADC")
+            self.controls.low.setValue(0)
+            self.controls.high.setValue(600)
+        else:
+            self._set_unit("ADC")
+            self.controls.low.setValue(0)
+            self.controls.high.setValue(4095)
+        for widget in (self.controls.low, self.controls.high, self.controls.auto_levels):
+            widget.setEnabled(norm != "B")
+        self._update_scale()
+
+    def _norm_changed(self, enabled):
+        if self.raw_adc:
+            return
+        self.controls.norm_mode.setEnabled(enabled)
+        self.pending_live_info = None
+        self.live_info_state = None
+        norm = self._active_norm()
+        logger.info("用户切换归一化开关 enabled=%s norm=%s", enabled, norm)
+        if self.worker is not None:
+            self.worker.buffer.set_norm(norm)
+            self._request_live_update()
+        self._norm_applied()
+
+    def _norm_mode_changed(self, *_):
+        if self.raw_adc or not self.controls.normalize.isChecked():
+            return
+        self.pending_live_info = None
+        self.live_info_state = None
+        norm = self._active_norm()
+        logger.info("用户切换归一化策略 norm=%s", norm)
+        if self.worker is not None:
+            self.worker.buffer.set_norm(norm)
+            self._request_live_update()
+        self._norm_applied()
 
     def _check_freshness(self):
         # No incoming-data signal exists during silence. This low-rate check

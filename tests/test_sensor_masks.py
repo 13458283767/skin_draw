@@ -81,54 +81,56 @@ def test_masked_points_in_rejected_row_are_not_held_or_counted():
     assert filter_.rejected_counts[1] == 1
 
 
-def test_thirty_raw_frames_calibrate_despite_arbitrary_empty_channels():
+def test_calibration_ignores_arbitrary_empty_channels():
     masks = SensorMasks().with_mask(7, np.array([[False, True, True]]))
-    buffer = LiveBuffer(calibration_seconds=0)
+    buffer = LiveBuffer(calib_n=30, norm="A")
     buffer.set_sensor_masks(masks)
-    for i in range(30):
+    for i in range(59):
         buffer.receive(Block(7, [[0 if i % 2 else 4095, 2500, 2450]]))
     snapshot = buffer.take()
-    assert snapshot.calibration.ready
-    assert snapshot.calibration.counts == {7: 30}
-    np.testing.assert_array_equal(snapshot.calibration.baseline[7], [[0, 2500, 2450]])
-    buffer.receive(Block(7, [[4095, 2000, 2300]]))
+    assert snapshot.preprocess.ready
+    assert snapshot.preprocess.samples == {7: 30}
+    np.testing.assert_array_equal(snapshot.preprocess.baselines[7], [[np.nan, 2500, 2450]])
+    for _ in range(35):
+        buffer.receive(Block(7, [[4095, 2000, 2300]]))
     pressed = buffer.take()
-    np.testing.assert_array_equal(pressed.display_values[7], [[0, 500, 150]])
+    np.testing.assert_array_equal(pressed.display_values[7], [[np.nan, 500, 150]])
     assert pressed.scan.frame.blocks[0].values[0, 0] == 4095
-    assert not pressed.filtered_counts
 
 
 def test_edit_resets_only_target_and_old_snapshot_remains_unchanged():
-    buffer = LiveBuffer(calibration_seconds=0)
-    for _ in range(30):
+    buffer = LiveBuffer(calib_n=30, norm="A")
+    for _ in range(59):
         for key in (1, 2):
             buffer.receive(Block(key, [[2500, 2500]]))
     old = buffer.take()
     masks = SensorMasks().with_mask(1, np.array([[False, True]]))
     buffer.set_sensor_masks(masks, 1)
     new = buffer.take()
-    assert new.calibration.counts == {2: 30}
+    assert not new.preprocess.ready
+    assert new.preprocess.samples == {1: 0, 2: 30}
     assert new.display_values[2] is old.display_values[2]
     assert 1 not in new.display_values
-    assert old.calibration.sensor_masks.get(1, (1, 2)).all()
-    assert new.calibration.sensor_masks.get(1, (1, 2)).tolist() == [[False, True]]
-    buffer.reset_calibration()
-    assert buffer.calibration.sensor_masks is masks
-    for _ in range(30):
+    assert old.preprocess.baselines[1][0, 0] == 2500
+    buffer.reset_preprocessing()
+    assert buffer.sensor_masks is masks
+    for _ in range(59):
         buffer.receive(Block(1, [[0, 2400]]))
-    assert buffer.calibration.baseline[1][0, 1] == 2400
+    assert buffer.preprocessors[1].baselines[0, 1] == 2400
 
 
-def test_hidden_positions_cannot_keep_rejected_block_fresh():
+def test_hidden_positions_are_nan_and_block_stays_fresh():
     now = [0.]
-    buffer = LiveBuffer(calibration_seconds=0, clock=lambda: now[0])
+    buffer = LiveBuffer(calib_n=30, norm="A", clock=lambda: now[0])
     buffer.set_sensor_masks(SensorMasks().with_mask(1, np.array([[False, True]])))
-    for _ in range(30):
+    for _ in range(59):
         buffer.receive(Block(1, [[0, 2500]]))
-    for i in range(1, 50):
+    for i in range(1, 36):
         now[0] = i / 10
-        buffer.receive(Block(1, [[i, 1000]]))
-    assert buffer.take().missing_counts[1] >= 1
+        buffer.receive(Block(1, [[i * 100, 2000]]))
+    snapshot = buffer.take()
+    assert snapshot.missing_counts[1] == 0
+    np.testing.assert_array_equal(snapshot.display_values[1], [[np.nan, 500]])
 
 
 @pytest.mark.parametrize("rotation", [0, 90, 180, 270])
@@ -250,37 +252,37 @@ def test_click_hidden_cell_does_not_select_first_sensor(app, tmp_path):
 def test_live_gui_edit_clears_only_target_and_recalibrates(app, tmp_path):
     from skin_draw.ui.serial_worker import SerialWorker
     window = MainWindow(mask_path=tmp_path / "mask.json")
-    worker = SerialWorker("FAKE", window)
-    worker.buffer.calibration.minimum_seconds = 0  # Mask reset, not duration, is under test.
+    worker = SerialWorker("FAKE", window, norm="A")
+    worker.buffer.calib_n = 30  # Mask reset, not duration, is under test.
     window.worker = worker
     window.accept_scans = True
     try:
-        for _ in range(30):
+        for _ in range(59):
             for key in (1, 2):
                 worker.buffer.receive(Block(key, [[2500, 2500]]))
-        worker.buffer.receive(Block(2, [[2300, 2300]]))
         window._flush_live()
-        assert window.calibration.ready
-        other_baseline = window.calibration.baseline[2]
+        assert window.preprocess.ready
         other_values = worker.buffer.display_values[2]
         window.apply_sensor_mask(1, np.array([[False, True]]))
         window._flush_live()
-        assert window.calibration.counts == {2: 30}
+        assert not window.preprocess.ready
+        assert window.preprocess.samples == {1: 0, 2: 30}
         assert window.heatmap.items[1].values is None
-        assert window.heatmap.items[2].values[0, 0] == 200
-        assert window.calibration.baseline[2] is other_baseline
+        assert window.heatmap.items[2].values[0, 0] == 0
+        assert window.preprocess.baselines[2][0, 0] == 2500
         assert worker.buffer.display_values[2] is other_values
-        for i in range(30):
+        for i in range(59):
             worker.buffer.receive(Block(1, [[0 if i % 2 else 4095, 2400]]))
-        worker.buffer.receive(Block(1, [[10, 2000]]))
+        for _ in range(35):
+            worker.buffer.receive(Block(1, [[10, 2000]]))
         window._flush_live()
-        assert window.calibration.ready
+        assert window.preprocess.ready
         assert window.heatmap.reading((1, 0, 0)) is None
         assert window.heatmap.reading((1, 0, 1)).value == 400
         # Saving unchanged points must not discard the completed baseline.
         window.apply_sensor_mask(1, np.array([[False, True]]))
         window._flush_live()
-        assert window.calibration.ready
+        assert window.preprocess.ready
         assert window.heatmap.reading((1, 0, 1)).value == 400
     finally:
         window.worker = None

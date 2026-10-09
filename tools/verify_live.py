@@ -1,4 +1,4 @@
-"""Exercise the real worker -> 30-sample baseline -> GUI path offscreen.
+"""Exercise the real worker -> M3 filter + slow baseline -> GUI path offscreen.
 
 Use --port COM6 for bounded real reception, or omit it for a 14 x 16 x 16
 synthetic rendering benchmark. Prints JSON; no firmware configuration is sent.
@@ -32,7 +32,7 @@ def main():
     window.show()
     app.processEvents()
     if not args.port:
-        buffer = LiveBuffer()
+        buffer = LiveBuffer(calib_n=30)
         timings = []
         for sequence in range(90):
             started = perf_counter()
@@ -44,10 +44,12 @@ def main():
             window.grab()  # force a complete Qt paint, not just event scheduling
             if sequence >= 30:
                 timings.append((perf_counter() - started) * 1000)
+        state = window.preprocess
         print(json.dumps({"synthetic": True, "blocks": 14, "sensors": 3584,
                           "mean_ms": round(float(np.mean(timings)), 2),
                           "p95_ms": round(float(np.percentile(timings, 95)), 2),
-                          "calibration_counts": window.calibration.counts}), flush=True)
+                          "preprocess_ready": state.ready if state else None,
+                          "preprocess_samples": dict(state.samples) if state else None}), flush=True)
         window.close()
         return
     window.controls.port.clear()
@@ -63,15 +65,16 @@ def main():
         original(scan, snapshot)
         window.grab()
         rendered.append((perf_counter() - paint_start) * 1000)
-        count = window.calibration.count
-        if count != last_progress and (count == 1 or count % 5 == 0):
+        state = window.preprocess
+        count = min(state.samples.values(), default=0) if state is not None else 0
+        if count != last_progress and (count == 1 or count % 30 == 0):
             last_progress = count
             print(json.dumps({"elapsed_seconds": round(monotonic() - started, 3),
-                              "counts": window.calibration.counts,
+                              "samples": dict(state.samples) if state else {},
                               "rates": snapshot.rates if snapshot else {},
-                              "ready": window.calibration.ready,
+                              "ready": bool(state is not None and state.ready),
                               "paint_ms": round(rendered[-1], 2)}), flush=True)
-        if window.calibration.ready and snapshot and snapshot.received_blocks >= 31 * len(scan.expected_ids):
+        if state is not None and state.ready and snapshot:
             print(json.dumps({"verified": True, "received_blocks": snapshot.received_blocks,
                               "mean_paint_ms": round(float(np.mean(rendered[1:])), 2),
                               "response_blocks": len(window.display_values)}), flush=True)
@@ -81,7 +84,7 @@ def main():
     window.controls.connect_button.click()
     QTimer.singleShot(round(args.timeout * 1000), window.close)
     app.exec()
-    if not window.calibration.ready:
+    if window.preprocess is None or not window.preprocess.ready:
         raise SystemExit("Baseline did not complete before the bounded verification ended")
 
 

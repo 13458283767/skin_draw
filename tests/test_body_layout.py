@@ -77,7 +77,7 @@ def test_idle_preset_only_shows_placeholders_and_can_return_to_grid(window):
     view = window.heatmap
     window.controls.body_positions.click()
     assert view.placement_mode == "body" and len(view.arrangement.slots) == 14
-    assert not view.items and not window.calibration.baseline
+    assert not view.items and window.preprocess is None
     assert window.current_frame.blocks == ()
     assert "识别到 0 块" in window.controls.detected.text()
     assert window.controls.reset_positions.isEnabled()

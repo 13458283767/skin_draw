@@ -1,3 +1,5 @@
+"""slow 标定语义：M3 暖机 + 中位数标定按样本计数，分块独立、与时间无关。"""
+
 import numpy as np
 import pytest
 
@@ -16,123 +18,130 @@ class Clock:
 
 def setup():
     clock = Clock()
-    return clock, LiveBuffer(clock=clock)
+    return clock, LiveBuffer(clock=clock, calib_n=30, norm="A")
 
 
-@pytest.mark.parametrize("hz", [20, 45, 50, 90, 180])
-def test_requires_duration_and_sample_count_at_each_rate(hz):
+@pytest.mark.parametrize("hz", [20, 45, 90, 180])
+def test_calibration_counts_samples_not_elapsed_time(hz):
     clock, buffer = setup()
+    frames = 0
     for i in range(300):
         clock.now = 100 + i / hz
         buffer.receive(Block(1, [[2500, 2490]]))
-        if buffer.calibration.ready:
+        frames += 1
+        if buffer.preprocessors[1].ready:
             break
-        assert buffer.calibration.progress < 100
-    row = buffer.calibration.rows[1][0]
-    assert row.count >= 30
-    assert row.seconds >= 1 - 1e-9
-    assert row.count == max(30, hz + 1)
-    assert buffer.calibration.progress == 100
-    np.testing.assert_array_equal(buffer.calibration.baseline[1], [[2500, 2490]])
+    assert frames == 59                      # 29 帧暖机 + 30 个标定样本，与帧率无关
+    np.testing.assert_allclose(buffer.preprocessors[1].baselines, [[2500, 2490]])
+    assert buffer.preprocessors[1].samples == 30
+    assert buffer.preprocessors[1].progress == 100
 
 
-def test_first_corrupt_frame_and_wrong_initial_cluster_both_recover():
-    for bad_samples in (1, 10):
-        clock, buffer = setup()
-        for i in range(180):
-            clock.now = 100 + i / 90
-            buffer.receive(Block(6, [[500 if i < bad_samples else 2500, 2500]]))
-        assert buffer.calibration.ready
-        np.testing.assert_array_equal(buffer.calibration.baseline[6], [[2500, 2500]])
-        np.testing.assert_array_equal(buffer.outlier_filter.previous[6].values, [[2500, 2500]])
-        buffer.receive(Block(6, [[2000, 2100]]))
-        np.testing.assert_array_equal(buffer.take().display_values[6], [[500, 400]])
-
-
-def test_unstable_row_does_not_delay_other_rows_or_blocks():
+def test_startup_low_frames_are_filtered_by_m3():
     clock, buffer = setup()
-    for i in range(110):
+    for i in range(120):
         clock.now += 1 / 90
-        buffer.receive(Block(1, [[2500, 2500], [500 if i % 2 else 2500, 2500]]))
-        buffer.receive(Block(2, [[2400, 2400]]))
-    first = buffer.take()
-    assert first.calibration.rows[1][0].result is not None
-    assert first.calibration.rows[1][1].result is None
-    assert first.calibration.pending_rows == {1: [2]}
-    assert 2 in first.display_values and 1 not in first.display_values
-    assert "行2" in first.calibration.progress_details
-    saved = first.calibration.rows[1][0].result.copy()
-    for i in range(110):
-        clock.now += 1 / 90
-        buffer.receive(Block(1, [[2450, 2450], [2500, 2500]]))
-    assert buffer.calibration.ready
-    np.testing.assert_array_equal(buffer.calibration.baseline[1][0], saved)
-    # Previously delivered snapshots must not mutate as new samples arrive.
-    assert first.calibration.rows[1][1].result is None
+        buffer.receive(Block(6, [[500 if i < 10 else 2500, 2500]]))
+    state = buffer.preprocessors[6]
+    assert state.ready
+    np.testing.assert_array_equal(state.baselines, [[2500, 2500]])   # 启动低电平不进基线
+    for _ in range(35):
+        buffer.receive(Block(6, [[2000, 2100]]))                     # 按压超过窗口滞后
+    snapshot = buffer.take()
+    np.testing.assert_allclose(snapshot.display_values[6], [[500, 400]], atol=1e-6)
 
 
-def test_intermittent_corruption_is_excluded_from_mean_and_runtime_rule_is_unchanged():
+def test_seven_blocks_calibrate_independently():
     clock, buffer = setup()
-    for i in range(180):
-        clock.now += 1 / 90
-        buffer.receive(Block(1, [[1000 if i % 5 == 0 else 2500, 2490]]))
-    assert buffer.calibration.ready
-    np.testing.assert_array_equal(buffer.calibration.baseline[1], [[2500, 2490]])
-    for _ in range(12):
-        buffer.receive(Block(1, [[1000, 2490]]))
-        snap = buffer.take()
-        assert snap.filtered_masks[1].all()
-        np.testing.assert_array_equal(snap.display_values[1], [[0, 0]])
-    buffer.receive(Block(1, [[2000, 2000]]))
-    np.testing.assert_array_equal(buffer.take().display_values[1], [[500, 490]])
-
-
-def test_no_time_progress_from_burst_or_silence():
-    clock, buffer = setup()
-    for _ in range(100):
-        buffer.receive(Block(1, [[2500]]))
-    assert not buffer.calibration.ready
-    clock.now += 10
-    buffer.receive(Block(1, [[2500]]))
-    assert not buffer.calibration.ready
-    assert buffer.calibration.rows[1][0].seconds == 0
-    for _ in range(31):
-        clock.now += .04
-        buffer.receive(Block(1, [[2500]]))
-    assert buffer.calibration.ready
-
-
-def test_masks_shape_changes_and_recalibration():
-    clock, buffer = setup()
-    mask = np.array([[False, True], [False, False]])
-    buffer.set_sensor_masks(SensorMasks().with_mask(7, mask))
-    for i in range(100):
-        clock.now += 1 / 90
-        buffer.receive(Block(7, [[4095 if i % 2 else 0, 2500], [0, 4095]]))
-    np.testing.assert_array_equal(buffer.calibration.baseline[7], [[0, 2500], [0, 0]])
-    buffer.receive(Block(7, [[2500]]))
-    assert not buffer.calibration.ready
-    for _ in range(100):
-        clock.now += 1 / 90
-        buffer.receive(Block(7, [[2500]]))
-    assert buffer.calibration.ready
-    buffer.reset_calibration()
-    assert not buffer.calibration.ready and buffer.calibration.progress == 0
-    assert not buffer.outlier_filter.previous
-
-
-def test_seven_blocks_calibrate_independently_without_waiting_for_paint():
-    clock, buffer = setup()
-    for i in range(100):
+    for i in range(59):
         clock.now += 1 / 90
         for key in range(1, 8):
             buffer.receive(Block(key, np.full((10, 5), 2500 + key)))
     snap = buffer.take()
-    assert len(snap.calibration.baseline) == 7
-    assert snap.calibration.ready and snap.received_blocks == 700
+    assert snap.preprocess.ready and snap.received_blocks == 413
+    assert len(snap.preprocess.baselines) == 7
+    for key in range(1, 8):
+        assert np.all(snap.preprocess.baselines[key] == 2500 + key)
 
 
-def test_ui_shows_duration_and_pending_rows(app, tmp_path):
+def test_slowest_block_does_not_block_others():
+    clock, buffer = setup()
+    for i in range(59):
+        clock.now += 1 / 90
+        buffer.receive(Block(1, [[2500]]))
+        if i < 40:
+            buffer.receive(Block(2, [[2400]]))
+    snap = buffer.take()
+    assert not snap.preprocess.ready
+    assert snap.preprocess.samples == {1: 30, 2: 11}     # 40 帧 - 29 暖机
+    assert np.isfinite(snap.preprocess.baselines[1]).all()
+    assert np.isnan(snap.preprocess.baselines[2]).all()
+    for _ in range(30):
+        clock.now += 1 / 90
+        buffer.receive(Block(2, [[2400]]))
+    snap = buffer.take()
+    assert snap.preprocess.ready
+    assert snap.preprocess.baselines[2][0, 0] == 2400    # 自己的样本集独立标定
+
+
+def test_intermittent_low_rail_is_excluded_from_baseline():
+    clock, buffer = setup()
+    for i in range(120):
+        clock.now += 1 / 90
+        buffer.receive(Block(1, [[1000 if i % 5 == 0 else 2500, 2490]]))
+    state = buffer.preprocessors[1]
+    assert state.ready
+    np.testing.assert_allclose(state.baselines, [[2500, 2490]])
+
+
+def test_progress_follows_samples_not_elapsed_time():
+    clock, buffer = setup()
+    for _ in range(29):
+        buffer.receive(Block(1, [[2500]]))
+    assert buffer.preprocessors[1].samples == 0
+    clock.now += 10                                      # 安静 10 秒不推进进度
+    buffer.receive(Block(1, [[2500]]))
+    assert buffer.preprocessors[1].samples == 1
+    for _ in range(29):
+        buffer.receive(Block(1, [[2500]]))
+    assert buffer.preprocessors[1].ready
+
+
+def test_mask_change_rebuilds_only_target_block():
+    clock, buffer = setup()
+    buffer.set_sensor_masks(SensorMasks().with_mask(7, np.array([[False, True]])))
+    for i in range(59):
+        clock.now += 1 / 90
+        buffer.receive(Block(7, [[0, 2500]]))
+        buffer.receive(Block(2, [[2400, 2400]]))
+    snap = buffer.take()
+    assert snap.preprocess.ready
+    assert np.isnan(snap.preprocess.baselines[7][0, 0])  # 空点位 NaN
+    assert snap.preprocess.baselines[7][0, 1] == 2500
+    buffer.set_sensor_masks(SensorMasks().with_mask(7, np.array([[True, True]])), 7)
+    snap = buffer.take()
+    assert not snap.preprocess.ready                    # 仅 BLOCK 7 重新标定
+    assert np.isnan(snap.preprocess.baselines[7]).all()
+    assert snap.preprocess.samples[2] == 30
+    buffer.reset_preprocessing()
+    assert not buffer.preprocessors[7].ready
+    assert buffer.preprocessors[7].samples == 0
+    assert not buffer.preprocessors[2].ready
+
+
+def test_shape_change_rebuilds_and_waits_for_new_baseline():
+    clock, buffer = setup()
+    for i in range(59):
+        clock.now += 1 / 90
+        buffer.receive(Block(7, [[2500, 2500]]))
+    assert buffer.preprocessors[7].ready
+    buffer.receive(Block(7, [[2500]]))                   # 尺寸变化 -> 重建
+    assert buffer.preprocessors[7].shape == (1, 1)
+    assert not buffer.preprocessors[7].ready
+    assert buffer.preprocessors[7].samples == 0
+
+
+def test_ui_shows_sample_progress_and_block_details(app, tmp_path):
     from skin_draw.ui.main_window import MainWindow
     clock, buffer = setup()
     window = MainWindow(mask_path=tmp_path / "mask.json")
@@ -142,9 +151,11 @@ def test_ui_shows_duration_and_pending_rows(app, tmp_path):
             buffer.receive(Block(1, [[2500], [500 if i % 2 else 2500]]))
         snap = buffer.take()
         window._consume_scan(snap.scan, snap)
-        assert "秒" in window.controls.calibration_details.text()
-        assert "样本" in window.controls.calibration_details.text()
         assert window.controls.calibration_progress.maximum() == 100
-        assert window.controls.calibration_progress.value() < 100
+        assert window.controls.calibration_progress.value() == 36   # 11/30 样本
+        assert "自动标定中" in window.controls.calibration_status.text()
+        assert "BLOCK 01 11/30" in window.controls.calibration_details.text()
+        assert not window.controls.calibration_details.isHidden()
     finally:
         window.close()
+        window.deleteLater()

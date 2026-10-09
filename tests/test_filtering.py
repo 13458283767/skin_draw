@@ -41,17 +41,17 @@ def test_repeated_corrupt_values_never_become_reference_and_recovery_is_immediat
 
 
 @pytest.mark.parametrize("jump", [900, 950, 1000])
-def test_block_four_jump_is_rejected_without_affecting_normal_press(jump):
-    buffer = LiveBuffer(calibration_seconds=0)
-    for _ in range(30):
+def test_m3_rejects_single_frame_jump_without_affecting_normal_press(jump):
+    buffer = LiveBuffer(calib_n=30, norm="A")
+    for _ in range(64):
         buffer.receive(Block(4, [[2500, 2500, 2500], [2500, 2500, 2500]]))
+    for _ in range(35):
+        buffer.receive(Block(4, [[2500, 2500, 2500], [2000, 2100, 2200]]))
     buffer.receive(Block(4, [[2500, 2500, 2500 - jump], [2000, 2100, 2200]]))
     snapshot = buffer.take()
     assert snapshot.display_values[4].tolist() == [[0, 0, 0], [500, 400, 300]]
-    assert snapshot.filtered_masks[4].tolist() == [[True] * 3, [False] * 3]
     buffer.receive(Block(4, [[2500, 2500, 2510], [2000, 2100, 2200]]))
     snapshot = buffer.take()
-    assert not snapshot.filtered_masks[4].any()
     assert snapshot.display_values[4].tolist() == [[0, 0, 0], [500, 400, 300]]
 
 
@@ -76,41 +76,50 @@ def test_first_sample_reset_shape_change_and_block_ids_have_separate_references(
     assert filter_.process(fresh)[0] is fresh
 
 
-def test_alternating_corruption_waits_for_consistent_calibration_samples():
-    buffer = LiveBuffer(calibration_seconds=0)
-    for count in range(1, 31):
+def test_alternating_low_rail_does_not_pollute_baseline():
+    buffer = LiveBuffer(calib_n=30, norm="A")
+    for count in range(1, 61):
         buffer.receive(Block(1, [[2500, 2500]]))
         buffer.receive(Block(1, [[1003, 2500]]))
         buffer.receive(Block(2, [[2000]]))
+    snapshot = buffer.take()
+    assert snapshot.preprocess.ready
+    assert snapshot.preprocess.samples == {1: 30, 2: 30}
+    np.testing.assert_array_equal(snapshot.preprocess.baselines[1], [[2500, 2500]])
+    np.testing.assert_array_equal(snapshot.preprocess.baselines[2], [[2000]])
+
+
+def test_gui_shows_not_ready_then_m3_press_and_recovers(app):
+    window = MainWindow()
+    try:
+        buffer = LiveBuffer(calib_n=30, norm="A")
+        for _ in range(29):
+            buffer.receive(Block(1, [[2500, 2500, 2500], [2500, 2500, 2500]]))
         snapshot = buffer.take()
-        assert 1 not in snapshot.calibration.baseline
-    assert snapshot.calibration.counts == {1: 0, 2: 30}
-    for _ in range(40):
-        buffer.receive(Block(1, [[2500, 2500]]))
-    snapshot = buffer.take()
-    np.testing.assert_array_equal(snapshot.calibration.baseline[1], [[2500, 2500]])
-    # Calibration does not seed the runtime filter with uncertain samples.
-    assert snapshot.filtered_counts == {}
-
-
-def test_gui_updates_other_rows_and_recovers_next_frame(app):
-    buffer, window = LiveBuffer(calibration_seconds=0), MainWindow()
-    for _ in range(30):
-        buffer.receive(Block(1, [[2500, 2500, 2500], [2500, 2500, 2500]]))
-    buffer.receive(Block(1, [[1003, 2000, 2300], [2000, 2100, 2200]]))
-    snapshot = buffer.take()
-    window._consume_scan(snapshot.scan, snapshot)
-    item = window.heatmap.items[1]
-    assert item.values.tolist() == [[0, 0, 0], [500, 400, 300]]
-    assert window.current_frame.blocks[0].values.tolist() == [[1003, 2000, 2300], [2000, 2100, 2200]]
-    window.heatmap.select_sensor((1, 0, 0))
-    assert "原始 ADC 1003" in window.selected_detail.text()
-    assert "保持上一有效值" in window.selected_detail.text()
-    buffer.receive(Block(1, [[2000, 2400, 2500], [2100, 2200, 2300]]))
-    snapshot = buffer.take()
-    window._consume_scan(snapshot.scan, snapshot)
-    assert item is window.heatmap.items[1]
-    assert item.values.tolist() == [[500, 100, 0], [400, 300, 200]]
-    assert not snapshot.filtered_masks[1].any()
-    window.close()
-    window.deleteLater()
+        window._consume_scan(snapshot.scan, snapshot)
+        assert window.heatmap.reading((1, 0, 0)).value is None       # 暖机帧：灰块
+        for _ in range(30):
+            buffer.receive(Block(1, [[2500, 2500, 2500], [2500, 2500, 2500]]))
+        for _ in range(35):
+            buffer.receive(Block(1, [[2500, 2500, 2500], [2000, 2100, 2200]]))
+        snapshot = buffer.take()
+        window._consume_scan(snapshot.scan, snapshot)
+        item = window.heatmap.items[1]
+        assert item.values.tolist() == [[0, 0, 0], [500, 400, 300]]
+        assert window.current_frame.blocks[0].values.tolist() == [[2500, 2500, 2500], [2000, 2100, 2200]]
+        window.heatmap.select_sensor((1, 1, 0))
+        assert "原始 ADC 2000" in window.selected_detail.text()
+        assert "基线 2500.0" in window.selected_detail.text()
+        assert "偏差 500.0" in window.selected_detail.text()
+        buffer.receive(Block(1, [[2500, 2500, 2500], [2100, 2200, 2300]]))
+        snapshot = buffer.take()
+        window._consume_scan(snapshot.scan, snapshot)
+        assert item is window.heatmap.items[1]
+        for _ in range(30):
+            buffer.receive(Block(1, [[2500, 2500, 2500], [2100, 2200, 2300]]))
+        snapshot = buffer.take()
+        window._consume_scan(snapshot.scan, snapshot)
+        assert item.values.tolist() == [[0, 0, 0], [400, 300, 200]]
+    finally:
+        window.close()
+        window.deleteLater()

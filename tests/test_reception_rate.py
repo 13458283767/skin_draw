@@ -27,7 +27,7 @@ def test_sliding_second_boundary_zero_after_silence_and_recovery():
 
 def test_fourteen_blocks_counts_actual_arrivals_without_gui_snapshots():
     clock = Clock()
-    buffer = LiveBuffer(calibration_seconds=0, clock=clock)
+    buffer = LiveBuffer(clock=clock)
     for frame in range(30):
         clock.now = frame / 30
         for key in range(1, 15):
@@ -48,7 +48,7 @@ def test_fourteen_blocks_counts_actual_arrivals_without_gui_snapshots():
 
 def test_counts_include_filtered_frames_but_exclude_invalid_and_not_ready():
     clock = Clock()
-    buffer = LiveBuffer(calibration_seconds=0, clock=clock)
+    buffer = LiveBuffer(clock=clock)
     for _ in range(30):
         buffer.receive(Block(1, [[2500]]))
     clock.now = 2  # Calibration arrivals are outside this counter window.
@@ -58,12 +58,12 @@ def test_counts_include_filtered_frames_but_exclude_invalid_and_not_ready():
     for block in parser.feed(data):
         buffer.receive(block)
     assert buffer.reception_counts() == {1: 2}
-    assert buffer.outlier_filter.rejected_counts == {1: 1}
-    assert buffer.calibration.counts == {1: 30}
-    buffer.reset_calibration()
+    assert buffer.preprocessors[1].samples == 3  # 帧 30 起收样本（29 帧暖机）
+    buffer.reset_preprocessing()
+    assert buffer.preprocessors[1].samples == 0
     buffer.set_direction(1)
     assert buffer.reception_counts() == {1: 2}
-    assert LiveBuffer(calibration_seconds=0, clock=clock).reception_counts() == {}  # reconnect = new buffer
+    assert LiveBuffer(clock=clock).reception_counts() == {}  # reconnect = new buffer
 
 
 def test_counter_prunes_during_continuous_reception():
@@ -86,7 +86,7 @@ def window(app):
 
 def test_rate_bar_total_details_and_silence_update_without_snapshot(window):
     clock = Clock()
-    buffer = LiveBuffer(calibration_seconds=0, clock=clock)
+    buffer = LiveBuffer(clock=clock)
     window.worker = SimpleNamespace(buffer=buffer)
     window.accept_scans = True
     for key in range(1, 15):

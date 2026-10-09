@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel
                                QProgressBar, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget)
 
 from ..colors import PALETTES
-from ..filtering import DEFAULT_MAX_JUMP
+from ..preprocessing import DEFAULT_DELTA, DEFAULT_FPS, DEFAULT_MIN_KEEP, DEFAULT_WINDOW
 from ..transport import BAUDRATES, DEFAULT_BAUDRATE
 from ..simulator import DEMO_PRESETS, PATTERNS
 
@@ -57,27 +57,41 @@ class ControlPanel(QFrame):
         self.connection_status = label("请选择硬件串口")
         self.connection_status.setWordWrap(True)
         box.addWidget(self.connection_status)
-        filter_note = label(f"有效点突变 > {DEFAULT_MAX_JUMP}：丢弃该行")
+        filter_note = label(f"M3 滤波：窗口 {DEFAULT_WINDOW} · 取高位均值")
         filter_note.setWordWrap(True)
-        filter_note.setToolTip(f"一行中任一有效点相对上一有效行对应点的 ADC 绝对变化超过 {DEFAULT_MAX_JUMP}，该行有效点保留上一有效值。隐藏空位不参与判断。其他行照常更新；下一帧该行全部有效点变化不超过 {DEFAULT_MAX_JUMP} 就立即放行。等于 {DEFAULT_MAX_JUMP} 保留，不设置固定 ADC 下限或基线差值上限。")
+        filter_note.setToolTip(
+            f"窗口 = 最近 {DEFAULT_WINDOW} 个原始采样；仅对窗口内 ≥ 最大值−{DEFAULT_DELTA} 的样本求均值，"
+            f"不足 {DEFAULT_MIN_KEEP} 个时保持上一输出。可抑制低电平伪影与上行尖峰；整窗平滑带来约 "
+            f"{DEFAULT_WINDOW / DEFAULT_FPS * 1000:.0f} 毫秒滞后，窗口可调。")
         if raw_adc:
-            filter_note.setText("原始 ADC 模式 · 不过滤跳变")
+            filter_note.setText("原始 ADC 模式 · 不过滤")
             filter_note.setToolTip("直接显示协议解析后的读数，包括低值、零值和大幅跳变；不扣除基线。")
         box.addWidget(filter_note)
         box.addWidget(label("原始读数" if raw_adc else "无按压基线", "section"))
         self.calibration_progress = QProgressBar()
         self.calibration_progress.setRange(0, 100)
         self.calibration_progress.setValue(0)
-        self.calibration_progress.setFormat("校准 %p%")
+        self.calibration_progress.setFormat("标定 %p%")
         box.addWidget(self.calibration_progress)
-        self.calibration_status = label("保持无按压，各行累计约1秒且至少30个有效样本")
+        self.calibration_status = label("连接后保持无按压，约3秒自动标定")
         self.calibration_status.setWordWrap(True)
         box.addWidget(self.calibration_status)
         self.calibration_details = label("")
         self.calibration_details.setWordWrap(True)
         self.calibration_details.hide()
         box.addWidget(self.calibration_details)
-        self.recalibrate = QPushButton("重新校准基线")
+        self.normalize = QCheckBox("归一化显示")
+        self.normalize.setChecked(True)
+        self.normalize.setToolTip("关闭后显示 M3 滤波原值（ADC）；开启后扣除基线，策略 B 输出 0–1 色阶，策略 A 输出偏差 LSB。")
+        self.normalize.setEnabled(False)
+        box.addWidget(self.normalize)
+        self.norm_mode = QComboBox()
+        self.norm_mode.addItem("B · 色阶 0–1（推荐）", "B")
+        self.norm_mode.addItem("A · 压力偏差 (LSB)", "A")
+        self.norm_mode.setToolTip("B：clip(偏差/600, 0, 1)，空载底色稳定；A：偏差 LSB，量程上限默认 600。")
+        self.norm_mode.setEnabled(False)
+        box.addWidget(self.norm_mode)
+        self.recalibrate = QPushButton("重置滤波与基线")
         self.recalibrate.setEnabled(False)
         box.addWidget(self.recalibrate)
         self.direction = QPushButton("受压变小 ↓  · 点击切换")
@@ -85,7 +99,8 @@ class ControlPanel(QFrame):
         box.addWidget(self.direction)
         if raw_adc:
             self.calibration_status.setText("收到首帧立即绘图，无需校准。")
-            for widget in (self.calibration_progress, self.recalibrate, self.direction):
+            for widget in (self.calibration_progress, self.recalibrate, self.direction,
+                           self.normalize, self.norm_mode):
                 widget.setEnabled(False)
                 widget.hide()
         box.addSpacing(5)

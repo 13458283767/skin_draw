@@ -130,7 +130,7 @@ class SensorGridItem(pg.GraphicsObject):
         painter.setFont(font)
         for row in range(self.values.shape[0]):
             for col in range(self.values.shape[1]):
-                if not self.valid_mask[row, col]:
+                if not self.valid_mask[row, col] or not np.isfinite(self.values[row, col]):
                     continue
                 red, green, blue = self.colors[row, col]
                 lightness = .2126 * red + .7152 * green + .0722 * blue
@@ -497,8 +497,8 @@ class HeatmapView(QWidget):
                     continue
                 array = np.array(values, dtype=float, copy=True)
                 if (block_id not in shapes or array.shape != shapes[block_id]
-                        or not np.isfinite(array).all() or np.any(array < 0) or np.any(array > 4095)):
-                    raise ValueError("显示值必须与原始块形状一致，且位于 0–4095")
+                        or np.isinf(array).any() or np.any(array < 0) or np.any(array > 4095)):
+                    raise ValueError("显示值必须与原始块形状一致，且位于 0–4095（NaN 表示未就绪）")
                 array.flags.writeable = False
                 prepared[block_id] = array
         # In physical-layout mode validate raw frames before replacing display state.
@@ -650,6 +650,8 @@ class HeatmapView(QWidget):
         if not item.valid_mask[row, col]:
             return None
         value = None if item.stale or item.values is None else item.values[row, col].item()
+        if value is not None and not np.isfinite(value):
+            value = None  # not-ready / empty points report no value
         return SensorReading(block_id, raw_row, raw_col, value)
 
     def select_sensor(self, key: tuple[int, int, int] | None) -> None:

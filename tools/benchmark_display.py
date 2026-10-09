@@ -29,7 +29,7 @@ def main():
     window.display_timer.stop()
     window.health_timer.stop()
     app.processEvents()
-    buffer = LiveBuffer()
+    buffer = LiveBuffer(calib_n=30)
     for _ in range(30):
         for key in range(1, 15):
             buffer.receive(Block(key, np.full((13, 5), 2500)))

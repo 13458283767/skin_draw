@@ -35,8 +35,7 @@ def test_packet_loss_never_rebuilds_or_moves_the_whole_heatmap(app):
         assert all(item.pos() == original_positions[key] for key, item in original_items.items())
         assert window.heatmap.view.viewRange() == zoom
         assert window.heatmap.selected == (2, 1, 1)
-        assert window.calibration.counts == {2: 30, 7: 30}
-        assert window.calibration.ready
+        assert window.preprocess is None  # direct injection bypasses the preprocessing chain
         # Spurious resize signals with unchanged dimensions must do nothing.
         for _ in range(5):
             window.heatmap._reflow()
@@ -69,7 +68,7 @@ def test_stale_values_are_not_reported_as_live_and_recovery_reuses_items(app):
     assert window.heatmap.items[7] is item
     window._consume_scan(packet(35, value=1500))
     assert not item.stale
-    assert window.heatmap.reading((7, 0, 0)).value == 500
+    assert window.heatmap.reading((7, 0, 0)).value == 1500  # direct path shows raw ADC
     window.close()
     window.deleteLater()
 
