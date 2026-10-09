@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "人体14块预设",
+  "note": "暂按用户示意图编号对应BLOCK ID；左右均指人体自身。rows/cols仅用于未连接占位。",
+  "blocks": [
+    {"id": 1, "name": "右肩", "row": 0, "column": 0, "rows": 5, "cols": 3},
+    {"id": 2, "name": "左肩", "row": 0, "column": 2, "rows": 5, "cols": 3},
+    {"id": 3, "name": "右上臂", "row": 1, "column": 0, "rows": 7, "cols": 3},
+    {"id": 4, "name": "左上臂", "row": 1, "column": 2, "rows": 7, "cols": 3},
+    {"id": 5, "name": "右下臂", "row": 2, "column": 0, "rows": 7, "cols": 4},
+    {"id": 6, "name": "左下臂", "row": 2, "column": 2, "rows": 7, "cols": 4},
+    {"id": 7, "name": "胸部", "row": 1, "column": 1, "rows": 10, "cols": 5},
+    {"id": 8, "name": "腹部", "row": 2, "column": 1, "rows": 10, "cols": 5},
+    {"id": 9, "name": "右大腿", "row": 4, "column": 1, "leg": "right", "rows": 13, "cols": 5},
+    {"id": 10, "name": "左大腿", "row": 4, "column": 1, "leg": "left", "rows": 13, "cols": 5},
+    {"id": 11, "name": "右手", "row": 3, "column": 0, "rows": 6, "cols": 3},
+    {"id": 12, "name": "左手", "row": 3, "column": 2, "rows": 6, "cols": 3},
+    {"id": 13, "name": "背部", "row": 1, "column": 3, "rows": 10, "cols": 5},
+    {"id": 14, "name": "腰部", "row": 2, "column": 3, "rows": 10, "cols": 5}
+  ]
+}

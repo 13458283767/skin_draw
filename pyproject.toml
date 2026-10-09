@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skin-draw"
+version = "0.1.0"
+description = "Modular electronic skin sensor heatmap viewer"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["PySide6>=6.8,<7", "pyqtgraph>=0.13.7,<0.15", "numpy>=1.26,<3", "pyserial>=3.5,<4"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.gui-scripts]
+skin-draw = "skin_draw.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+skin_draw = ["presets/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

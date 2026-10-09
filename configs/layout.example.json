@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "blocks": [
+    {"block_id": 1, "rows": 5, "cols": 3, "x": 0, "y": 0},
+    {"block_id": 2, "rows": 5, "cols": 3, "x": 5, "y": 0},
+    {"block_id": 3, "rows": 7, "cols": 3, "x": 0, "y": 7},
+    {"block_id": 4, "rows": 7, "cols": 3, "x": 5, "y": 7}
+  ]
+}
+

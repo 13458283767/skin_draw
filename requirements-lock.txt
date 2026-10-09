@@ -1,0 +1,9 @@
+# Runtime versions verified on Windows / Python 3.11.
+PySide6==6.11.2
+PySide6_Addons==6.11.2
+PySide6_Essentials==6.11.2
+shiboken6==6.11.2
+pyqtgraph==0.14.0
+numpy==2.4.6
+colorama==0.4.6
+pyserial==3.5
