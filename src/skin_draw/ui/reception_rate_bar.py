@@ -12,7 +12,7 @@ class ReceptionRateBar(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(12)
         self.total_label = label("接收 0 块帧/秒", "badge")
-        self.total_label.setToolTip("一块皮肤的一个完整有效矩阵记为1块帧。统计最近1秒解析成功并交付采集处理的数据，包含校准帧和随后被异常行过滤的帧；不含解析失败、未就绪回复或模拟数据。")
+        self.total_label.setToolTip("一块皮肤的一个完整有效矩阵记为1块帧。统计最近1秒解析成功并交付采集处理的数据，包含标定帧和随后经滤波处理的帧；不含解析失败、未就绪回复或模拟数据。")
         row.addWidget(self.total_label)
         self.block_button = QToolButton()
         self.block_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)

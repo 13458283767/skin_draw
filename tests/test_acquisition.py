@@ -4,7 +4,11 @@ import numpy as np
 import pytest
 
 from skin_draw.acquisition import SerialAcquisition
-from skin_draw.processing import BaselineCalibration
+from skin_draw.live import LiveBuffer
+
+QUIET_ROUNDS = 90     # polling rounds at 2300 before the press
+PRESS_ROUNDS = 35     # rounds at 1800 after the press (M3 latency is 29 frames)
+TOTAL_SCANS = 1 + QUIET_ROUNDS + PRESS_ROUNDS
 
 
 class FakeClock:
@@ -16,9 +20,10 @@ class FakeClock:
 
 
 class FakePort:
-    def __init__(self, clock, ids=(1, 14), fail=False):
+    def __init__(self, clock, ids=(1, 14), fail=False, quiet_requests=30):
         self.clock = clock
         self.ids = ids
+        self.quiet_requests = quiet_requests
         self.pending = bytearray()
         self.commands = []
         self.counts = {}
@@ -38,7 +43,7 @@ class FakePort:
         block_id = int(command.decode().split()[2])
         self.counts[block_id] = self.counts.get(block_id, 0) + 1
         if block_id in self.ids:
-            value = 2300 if self.counts[block_id] <= 30 else 1800
+            value = 2300 if self.counts[block_id] <= self.quiet_requests else 1800
             # Mixed shapes and optional END in the same scan.
             if block_id % 2:
                 text = f"BLOCK_{block_id},2,2:\r\n{value},{value}\r\n{value},{value}\r\nEND\r\n"
@@ -60,29 +65,33 @@ class FakePort:
 
 
 @pytest.mark.parametrize("ids", [(1,), (2, 7), tuple(range(1, 15))])
-def test_devices_discovery_to_thirty_frame_baseline_to_press(ids):
+def test_devices_discovery_to_auto_baseline_to_press(ids):
     stop, clock = Event(), FakeClock()
-    port = FakePort(clock, ids)
-    calibration = BaselineCalibration(minimum_seconds=0)
-    scans, responses = [], []
+    port = FakePort(clock, ids, quiet_requests=1 + QUIET_ROUNDS)
+    live = LiveBuffer(calib_n=30, norm="A")
+    # Deterministic cadence: the real cadence would derive upd_n from the
+    # measured rate; here the press window must stay below one slow-baseline
+    # update so the frozen 2300 baseline yields exactly 500 on display.
+    live._measured_fps = lambda key: 100.0
+    scans = []
 
     def on_scan(scan):
         scans.append(scan)
-        responses.append(calibration.consume(scan.frame, scan.expected_ids))
-        if len(scans) == 31:
+        for block in scan.frame.blocks:
+            live.receive(block)
+        if len(scans) == TOTAL_SCANS:
             stop.set()
 
     SerialAcquisition("FAKE", stop, on_scan, lambda _: None, factory=lambda _: port,
                       response_timeout=.2, quiet_time=.01, clock=clock).run()
-    assert len(scans) == 31 and all(scan.complete for scan in scans)
+    assert len(scans) == TOTAL_SCANS and all(scan.complete for scan in scans)
     assert scans[0].expected_ids == ids
-    assert len(port.commands) == 16 + 30 * len(ids)
+    assert len(port.commands) == 16 + (TOTAL_SCANS - 1) * len(ids)
     assert port.commands[0] == b"hello num 1\r\n"
     assert port.commands[15] == b"hello num 16\r\n"
-    assert all(response == {} for response in responses[:29])
-    assert calibration.ready
-    for values in responses[-1].values():
-        np.testing.assert_allclose(values, 500)
+    for key in ids:
+        assert live.preprocessors[key].ready
+        np.testing.assert_allclose(live.display_values[key], 500)
     assert port.closed
 
 

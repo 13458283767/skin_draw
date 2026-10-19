@@ -7,7 +7,6 @@ from PySide6.QtGui import QImage, QPainter
 from PySide6.QtTest import QTest
 
 from skin_draw.colors import ColorScale
-from skin_draw.filtering import ADCOutlierFilter
 from skin_draw.live import LiveBuffer
 from skin_draw.mapping import BlockLayout, BlockOrientation
 from skin_draw.models import Block, Frame
@@ -57,28 +56,6 @@ def test_atomic_save_failure_keeps_original(tmp_path, monkeypatch):
         SensorMasks().with_mask(1, np.zeros((2, 3), bool)).save(path)
     assert path.read_bytes() == before
     assert not list(tmp_path.glob("*.tmp"))
-
-
-def test_hidden_jumps_do_not_reject_row_and_raw_values_remain_intact():
-    mask = np.array([[False, True, True], [True, True, True]])
-    filter_ = ADCOutlierFilter()
-    filter_.process(Block(7, np.full((2, 3), 2500)), mask)
-    raw = Block(7, [[50, 2000, 2400], [2500, 1000, 2500]])
-    filtered, invalid = filter_.process(raw, mask)
-    np.testing.assert_array_equal(invalid, [[False, False, False], [True, True, True]])
-    np.testing.assert_array_equal(filtered.values, [[50, 2000, 2400], [2500, 2500, 2500]])
-    assert raw.values[1, 1] == 1000
-    assert filter_.rejected_counts == {7: 3}
-
-
-def test_masked_points_in_rejected_row_are_not_held_or_counted():
-    filter_ = ADCOutlierFilter()
-    valid = np.array([[False, True]])
-    filter_.process(Block(1, [[2500, 2500]]), valid)
-    filtered, invalid = filter_.process(Block(1, [[20, 900]]), valid)
-    np.testing.assert_array_equal(filtered.values, [[20, 2500]])
-    np.testing.assert_array_equal(invalid, [[False, True]])
-    assert filter_.rejected_counts[1] == 1
 
 
 def test_calibration_ignores_arbitrary_empty_channels():
