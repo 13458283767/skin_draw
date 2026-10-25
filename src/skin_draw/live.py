@@ -33,6 +33,7 @@ class PreprocessState:
     target: int                                       # calibration samples per point (calib_n)
     baselines: dict[int, np.ndarray]                  # read-only baseline matrices, for the selected-point detail
     samples: dict[int, int]                           # per-block calibration samples, for the progress detail
+    filter_enabled: bool = True                       # snapshot 与显示值使用同一滤波状态
 
 
 @dataclass(frozen=True)
@@ -52,10 +53,13 @@ def _direction_name(direction) -> str:
 
 
 class LiveBuffer:
-    def __init__(self, direction=-1, clock=perf_counter, *, calib_n=270, raw_adc=False, norm="B"):
+    def __init__(self, direction=-1, clock=perf_counter, *, calib_n=270, raw_adc=False, norm="B",
+                 filter_enabled=True):
         self.lock = Lock()
         self.clock = clock
         self.raw_adc = raw_adc
+        # 算法调用保留历史默认值；主界面显式传入按钮状态，启动时关闭。
+        self.filter_enabled = bool(filter_enabled) and not raw_adc
         self.norm = norm
         self.direction = -1 if int(direction) < 0 else 1
         self.calib_n = max(1, int(calib_n))
@@ -66,6 +70,7 @@ class LiveBuffer:
         self.received_at: dict[int, float] = {}
         self.arrivals: dict[int, float] = {}
         self.intervals: dict[int, deque] = {}
+        self.quality_intervals: dict[int, deque] = {}
         self.reception_rate = ReceptionRate()
         self.missing_counts: dict[int, int] = {}
         self.sequence = 0
@@ -73,6 +78,14 @@ class LiveBuffer:
         self.protocol_errors = 0
         self.dirty = False
         self.last_missing = {}
+        # Optional raw-recording sink (block, receive_time). It runs on the serial
+        # thread, before any filtering, and must therefore stay cheap and non-Qt.
+        self.raw_sink = None
+
+    def set_raw_sink(self, sink):
+        """Attach/detach training recording; taking the lock serialises it with reception."""
+        with self.lock:
+            self.raw_sink = sink
 
     def _measured_fps(self, key):
         """Measured per-block rate from recent intervals; delivery-pack fallback."""
@@ -88,7 +101,8 @@ class LiveBuffer:
             fps = self._measured_fps(key)
             preprocessor = BlockPreprocessor(shape, self.sensor_masks.get(key, shape),
                                              norm=self.norm, direction=_direction_name(self.direction),
-                                             fps=fps, calib_n=self.calib_n)
+                                             fps=fps, calib_n=self.calib_n,
+                                             filter_enabled=self.filter_enabled)
             self.preprocessors[key] = preprocessor
             event(logger, logging.INFO, "皮肤块预处理已启动", block_id=key, shape=tuple(shape),
                   fps=round(fps, 1), upd_n=preprocessor.upd_n, norm=self.norm)
@@ -103,6 +117,7 @@ class LiveBuffer:
                 interval = now - self.received_at[key]
                 if interval >= 0:
                     self.intervals.setdefault(key, deque(maxlen=10)).append(interval)
+                    self.quality_intervals.setdefault(key, deque(maxlen=128)).append((now, interval))
             self.received_at[key] = now
             self.sequence += 1
             self.dirty = True
@@ -112,11 +127,16 @@ class LiveBuffer:
                 event(logger, logging.WARNING, "有效点位尺寸不匹配，暂按全部有效处理，请重新编辑",
                       block_id=key, shape=block.values.shape)
             if previous is not None and previous.values.shape != block.values.shape:
+                self.quality_intervals.pop(key, None)
                 event(logger, logging.WARNING, "尺寸变化，重新自动标定该块", block_id=key,
                       previous=previous.values.shape, current=block.values.shape)
             self.blocks[key] = block
             self.arrivals[key] = now
             self.missing_counts[key] = 0
+            # Hand the untouched block to the recorder first: training data must
+            # never depend on the display preprocessing or on GUI refresh timing.
+            if self.raw_sink is not None:
+                self.raw_sink(block, now)
             if self.raw_adc:
                 # Diagnostic display: preserve the exact parsed matrix, including
                 # large jumps and zeros. Never filter or subtract a baseline.
@@ -143,7 +163,7 @@ class LiveBuffer:
                 self.preprocessors[key] = BlockPreprocessor(
                     block.values.shape, self.sensor_masks.get(key, block.values.shape),
                     norm=self.norm, direction=_direction_name(self.direction),
-                    fps=fps, calib_n=self.calib_n)
+                    fps=fps, calib_n=self.calib_n, filter_enabled=self.filter_enabled)
             self.dirty = True
             if keys:
                 event(logger, logging.INFO, "更新有效点位，重新自动标定对应皮肤块", blocks=keys)
@@ -180,6 +200,25 @@ class LiveBuffer:
                 self.display_values[key] = preprocessor.recompose()
             self.dirty = True
 
+    def set_filter_enabled(self, enabled):
+        """与串口接收互斥地切换滤波，清除旧显示和基线，不改写原始块。"""
+        if self.raw_adc:
+            return
+        with self.lock:
+            enabled = bool(enabled)
+            if self.filter_enabled == enabled:
+                return
+            self.filter_enabled = enabled
+            for key, preprocessor in self.preprocessors.items():
+                preprocessor.set_filter_enabled(enabled)
+                if not enabled:
+                    # 关闭后可以立即显示最近的 ADC，但旧帧不能再计为标定样本。
+                    np.copyto(preprocessor.filtered, np.where(
+                        preprocessor.valid, self.blocks[key].values, np.nan))
+                self.display_values[key] = preprocessor.recompose()
+            self.dirty = True
+            logger.info("切换 M3 滤波并重置基线 enabled=%s", enabled)
+
     def set_norm(self, norm):
         if norm not in NORM_MODES:
             raise ValueError("归一化模式必须为 none/A/B")
@@ -197,7 +236,8 @@ class LiveBuffer:
         if not preprocessors:
             return "等待数据"
         if self.norm == "none":
-            return "归一化已关闭 · 显示 M3 滤波原值"
+            return ("归一化已关闭 · 显示 M3 滤波原值" if self.filter_enabled else
+                    "归一化已关闭 · 显示原始 ADC（滤波关闭）")
         if all(preprocessor.ready for preprocessor in preprocessors):
             return "自动标定完成 · 慢跟踪运行中（长按可能缓慢回落）"
         return "自动标定中 · 请保持无按压（约3秒）"
@@ -205,7 +245,7 @@ class LiveBuffer:
     def _preprocess_state(self):
         if self.raw_adc:
             return PreprocessState(True, 100, "原始 ADC 模式 · 不扣基线", self.direction, "none",
-                                   self.calib_n, {}, {})
+                                   self.calib_n, {}, {}, False)
         keys = sorted(self.preprocessors)
         preprocessors = [self.preprocessors[key] for key in keys]
         ready = bool(preprocessors) and all(preprocessor.ready for preprocessor in preprocessors)
@@ -213,7 +253,45 @@ class LiveBuffer:
         return PreprocessState(ready, progress, self._message(preprocessors), self.direction, self.norm,
                                self.calib_n,
                                {key: self.preprocessors[key].baselines for key in keys},
-                               {key: self.preprocessors[key].samples for key in keys})
+                               {key: self.preprocessors[key].samples for key in keys},
+                               self.filter_enabled)
+
+    def baseline_snapshot(self):
+        """Copy the current raw-order baselines for a sample's calibration_id.
+
+        Returns (``{block_id: matrix}``, minimum calibration samples). Matrices are
+        copies, so later slow-tracker updates cannot rewrite an already saved
+        sample; blocks whose baseline is still incomplete are omitted instead of
+        being stored as fabricated zeros.
+        """
+        with self.lock:
+            baselines, counts = {}, []
+            for key, preprocessor in self.preprocessors.items():
+                if preprocessor.norm == "none":
+                    continue
+                matrix = preprocessor.baselines
+                if np.isfinite(matrix).any():
+                    baselines[key] = np.array(matrix, dtype=float, copy=True)
+                    counts.append(preprocessor.samples)
+            return baselines, (min(counts) if counts else 0)
+
+    def recording_cadence(self, ids, policy):
+        """冻结录制前近期接收间隔；陈旧、突发成批或不稳定参考不用于放宽阈值。"""
+        with self.lock:
+            now = self.clock()
+            references = []
+            for key in ids:
+                values = [interval for timestamp, interval in self.quality_intervals.get(key, ())
+                          if now - policy.reference_window_s <= timestamp <= now
+                          and np.isfinite(interval) and interval >= 0]
+                median = float(np.median(values)) if values else 0.
+                reliable = len(values) >= policy.min_reference_intervals and median >= .001
+                if reliable:
+                    low, high = np.percentile(values, [10, 90])
+                    reliable = low >= .001 and high <= 5 * low
+                    reliable = reliable and now - self.received_at.get(key, -float("inf")) <= max(1., 5 * median)
+                references.append((key, median if reliable else None, len(values)))
+            return tuple(references)
 
     def reception_counts(self) -> dict[int, int]:
         """Read the last-second counts even when no new display snapshot exists."""

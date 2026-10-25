@@ -6,12 +6,10 @@
       "valid": [
         [
           true,
-          false,
-          false,
-          false
+          true,
+          true
         ],
         [
-          true,
           true,
           true,
           true
@@ -19,17 +17,9 @@
         [
           true,
           true,
-          true,
           true
         ],
         [
-          true,
-          true,
-          true,
-          true
-        ],
-        [
-          true,
           true,
           true,
           true
@@ -37,14 +27,7 @@
         [
           true,
           true,
-          true,
           true
-        ],
-        [
-          true,
-          false,
-          false,
-          false
         ]
       ]
     },
@@ -52,12 +35,10 @@
       "valid": [
         [
           true,
-          false,
-          false,
-          false
+          true,
+          true
         ],
         [
-          true,
           true,
           true,
           true
@@ -65,17 +46,9 @@
         [
           true,
           true,
-          true,
           true
         ],
         [
-          true,
-          true,
-          true,
-          true
-        ],
-        [
-          true,
           true,
           true,
           true
@@ -83,18 +56,50 @@
         [
           true,
           true,
-          true,
           true
-        ],
-        [
-          true,
-          false,
-          false,
-          false
         ]
       ]
     },
     "3": {
+      "valid": [
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ]
+      ]
+    },
+    "4": {
       "valid": [
         [
           true,
@@ -296,6 +301,80 @@
           true,
           false,
           false
+        ]
+      ]
+    },
+    "8": {
+      "valid": [
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
         ]
       ]
     }

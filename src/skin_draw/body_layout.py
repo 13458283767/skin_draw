@@ -21,21 +21,24 @@ class BodyArrangement(AutoLayout):
 
 
 def arrange_body(frame: Frame, width: float, height: float,
-                 orientations: dict[int, BlockOrientation] | None = None) -> BodyArrangement:
+                 orientations: dict[int, BlockOrientation] | None = None,
+                 reference_specs: tuple[BlockLayout, ...] = ()) -> BodyArrangement:
     """Reserve the full body when only some IDs are connected.
 
     Positions depend on physical slots and dimensions, never on arrival order.
     Unknown IDs 15/16 occupy a separate area beneath the back/waist.
     Matrix dimensions always come from data for observed blocks; placeholders
-    use the diagram's illustrative sizes and never enter Frame/calibration.
+    use saved dimensions (or illustrative sizes) and never enter Frame/calibration.
     """
     shapes = {b.block_id: b.values.shape for b in frame.blocks}
+    reference_shapes = {spec.block_id: (spec.rows, spec.cols) for spec in reference_specs}
+    reference_shapes.update(shapes)
     entries = list(BODY_PRESET)
     entries += [{"id": key, "name": "未分配",
                  "rows": shapes[key][0], "cols": shapes[key][1]}
                 for key in sorted(shapes) if key not in BODY_NAMES]
     specs = {e["id"]: (orientations or {}).get(e["id"], BlockOrientation()).apply(
-        BlockLayout(e["id"], *shapes.get(e["id"], (e["rows"], e["cols"])))) for e in entries}
+        BlockLayout(e["id"], *reference_shapes.get(e["id"], (e["rows"], e["cols"])))) for e in entries}
     # Use actual oriented dimensions, rather than a rotation-sized square for
     # every block. Hands sit beside the thighs; each arm and the torso form
     # their own vertical chain, so a tall back does not stretch the whole body.

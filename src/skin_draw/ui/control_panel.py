@@ -57,16 +57,19 @@ class ControlPanel(QFrame):
         self.connection_status = label("请选择硬件串口")
         self.connection_status.setWordWrap(True)
         box.addWidget(self.connection_status)
-        filter_note = label(f"M3 滤波：窗口 {DEFAULT_WINDOW} · 取高位均值")
-        filter_note.setWordWrap(True)
-        filter_note.setToolTip(
+        self.filter_toggle = QPushButton("M3 滤波：关闭 · 点击开启")
+        self.filter_toggle.setCheckable(True)
+        self.filter_toggle.setToolTip(
+            "默认关闭，直接使用当前 ADC；点击开启，再次点击关闭。仅影响显示处理，不改变采集的原始 ADC。"
+            "切换后会重新标定基线，请保持无按压。\n"
             f"窗口 = 最近 {DEFAULT_WINDOW} 个原始采样；仅对窗口内 ≥ 最大值−{DEFAULT_DELTA} 的样本求均值，"
-            f"不足 {DEFAULT_MIN_KEEP} 个时保持上一输出。可抑制低电平伪影与上行尖峰；整窗平滑带来约 "
-            f"{DEFAULT_WINDOW / DEFAULT_FPS * 1000:.0f} 毫秒滞后，窗口可调。")
+            f"不足 {DEFAULT_MIN_KEEP} 个时保持上一输出。可抑制短暂低值；整窗平滑在约 {DEFAULT_FPS:g} 帧/秒时带来约 "
+            f"{DEFAULT_WINDOW / DEFAULT_FPS * 1000:.0f} 毫秒滞后。")
         if raw_adc:
-            filter_note.setText("原始 ADC 模式 · 不过滤")
-            filter_note.setToolTip("直接显示协议解析后的读数，包括低值、零值和大幅跳变；不扣除基线。")
-        box.addWidget(filter_note)
+            self.filter_toggle.setText("原始 ADC 模式 · 不过滤")
+            self.filter_toggle.setEnabled(False)
+            self.filter_toggle.setToolTip("直接显示协议解析后的读数，包括低值、零值和大幅跳变；不扣除基线。")
+        box.addWidget(self.filter_toggle)
         box.addWidget(label("原始读数" if raw_adc else "无按压基线", "section"))
         self.calibration_progress = QProgressBar()
         self.calibration_progress.setRange(0, 100)
@@ -82,7 +85,7 @@ class ControlPanel(QFrame):
         box.addWidget(self.calibration_details)
         self.normalize = QCheckBox("归一化显示")
         self.normalize.setChecked(True)
-        self.normalize.setToolTip("关闭后显示 M3 滤波原值（ADC）；开启后扣除基线，策略 B 输出 0–1 色阶，策略 A 输出偏差 LSB。")
+        self.normalize.setToolTip("关闭后显示 ADC（是否滤波由 M3 按钮决定）；开启后扣除基线，策略 B 输出 0–1 色阶，策略 A 输出偏差 LSB。")
         self.normalize.setEnabled(False)
         box.addWidget(self.normalize)
         self.norm_mode = QComboBox()
@@ -147,9 +150,23 @@ class ControlPanel(QFrame):
         self.mask_status = label("有效点位按 BLOCK 编号保存，重启自动恢复。")
         self.mask_status.setWordWrap(True)
         box.addWidget(self.mask_status)
-        note = label("仅调整所选皮肤块。\n方向在本次运行期间保留。")
+        note = label("调整好位置、方向和有效点位后，\n保存到本地，重启自动调用。")
         note.setWordWrap(True)
         box.addWidget(note)
+        self.save_collection_layout = QPushButton("保存并固定采集布局")
+        self.save_collection_layout.setEnabled(False)
+        self.save_collection_layout.setToolTip("将各块摆放位置、方向、尺寸、通道映射和有效点位保存到本地；每次保存创建新版本。")
+        box.addWidget(self.save_collection_layout)
+        self.edit_collection_layout = QPushButton("调整采集布局")
+        self.edit_collection_layout.setEnabled(False)
+        box.addWidget(self.edit_collection_layout)
+        self.restore_collection_layout = QPushButton("调用本地采集布局")
+        self.restore_collection_layout.setToolTip("从本地重新读取上次保存的布局，恢复位置、方向和有效点位；无需重新预设。")
+        self.restore_collection_layout.setEnabled(False)
+        box.addWidget(self.restore_collection_layout)
+        self.collection_layout_status = label("尚未固定采集布局")
+        self.collection_layout_status.setWordWrap(True)
+        box.addWidget(self.collection_layout_status)
         for widget in (self.orientation_block, self.rotate_left, self.rotate_right,
                        self.mirror_horizontal, self.mirror_vertical, self.reset_orientation):
             widget.setEnabled(False)

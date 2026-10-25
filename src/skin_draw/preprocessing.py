@@ -114,7 +114,8 @@ class BlockPreprocessor:
     """Whole-block per-point pipeline: M3 -> slow baseline -> normalization.
 
     - Empty points (``valid_mask`` False) are skipped and output NaN.
-    - norm="none" outputs the M3-filtered raw value and never collects a
+    - ``filter_enabled=False`` bypasses M3 and its warm-up entirely.
+    - norm="none" outputs the optionally filtered raw value and never collects a
       baseline; switching to "A"/"B" starts collection from that moment.
     - norm="A" outputs the pressure deviation with negative values clamped to
       zero so it stays inside the renderer's 0-4095 contract.
@@ -127,7 +128,8 @@ class BlockPreprocessor:
 
     def __init__(self, shape, valid_mask, *, norm="B", direction="drop",
                  fps=DEFAULT_FPS, upd_sec=1., calib_n=270, upd_n=90, alpha=.2,
-                 r_ref=600., w=DEFAULT_WINDOW, delta=DEFAULT_DELTA, n_min=DEFAULT_MIN_KEEP):
+                 r_ref=600., w=DEFAULT_WINDOW, delta=DEFAULT_DELTA, n_min=DEFAULT_MIN_KEEP,
+                 filter_enabled=True):
         if norm not in NORM_MODES:
             raise ValueError("归一化模式必须为 none/A/B")
         if direction not in DIRECTIONS:
@@ -139,6 +141,7 @@ class BlockPreprocessor:
         self.shape = (rows, cols)
         self.valid = np.frombuffer(valid.tobytes(), dtype=bool).reshape(valid.shape)
         self.norm = norm
+        self.filter_enabled = bool(filter_enabled)
         self.direction = direction
         self.r_ref = float(r_ref)
         self.w = int(w)
@@ -163,11 +166,13 @@ class BlockPreprocessor:
             for col in range(self.shape[1]):
                 if not self.valid[row, col]:
                     continue
-                filtered = self.filters[row][col].update(array[row, col])
+                # 关闭滤波时直接使用本帧读数，不更新滑窗，也不等待窗口暖机。
+                filtered = (self.filters[row][col].update(array[row, col])
+                            if self.filter_enabled else float(array[row, col]))
                 if filtered is None:
                     continue
                 self.filtered[row, col] = filtered
-                if self.norm == "none" or self.frames < self.w:
+                if self.norm == "none" or (self.filter_enabled and self.frames < self.w):
                     # none never collects; during the warm-up frames the M3
                     # window is not full, so its output must not seed a baseline.
                     continue
@@ -244,6 +249,13 @@ class BlockPreprocessor:
         if direction not in DIRECTIONS:
             raise ValueError("受压方向必须为 drop 或 rise")
         self.direction = direction
+
+    def set_filter_enabled(self, enabled):
+        """切换滤波后重新标定，避免新读数沿用另一种处理方式的基线。"""
+        enabled = bool(enabled)
+        if self.filter_enabled != enabled:
+            self.filter_enabled = enabled
+            self.reset()
 
     def set_norm(self, norm):
         if norm not in NORM_MODES:

@@ -16,13 +16,15 @@ class SerialWorker(QThread):
     data_ready = Signal()
 
     def __init__(self, port: str, parent=None, mode="auto", direction=-1,
-                 protocol="auto", baudrate=DEFAULT_BAUDRATE, *, raw_adc=False, norm="B"):
+                 protocol="auto", baudrate=DEFAULT_BAUDRATE, *, raw_adc=False, norm="B",
+                 filter_enabled=True):
         super().__init__(parent)
         self.port = port
         self.mode = mode
         self.protocol = protocol
         self.baudrate = baudrate
-        self.buffer = LiveBuffer(direction, raw_adc=raw_adc, norm=norm)
+        self.buffer = LiveBuffer(direction, raw_adc=raw_adc, norm=norm,
+                                 filter_enabled=filter_enabled)
         self.stop_event = Event()
         self._notification_lock = Lock()
         self._notification_pending = False

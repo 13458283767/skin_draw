@@ -1,0 +1,9 @@
+{
+  "warning_floor_s": 0.2,
+  "failure_floor_s": 1.0,
+  "warning_multiplier": 5.0,
+  "failure_multiplier": 20.0,
+  "min_reference_intervals": 10,
+  "reference_window_s": 5.0,
+  "max_events": 100
+}

@@ -1,0 +1,6 @@
+{
+  "threshold_counts": 100,
+  "hug_min_regions": 3,
+  "max_block_switches": 0,
+  "multi_region_actions": ["hug"]
+}

@@ -48,6 +48,10 @@ def apply_theme(app: QApplication) -> None:
         QComboBox, QSpinBox { background: #f9fbfd; border: 1px solid #d8e0e9;
                              border-radius: 5px; padding: 5px 8px; min-height: 21px; }
         QComboBox:focus, QSpinBox:focus { border-color: #147d83; }
+        QLineEdit { background: #f9fbfd; border: 1px solid #d8e0e9; border-radius: 5px;
+                    padding: 5px 8px; min-height: 19px; color: #233348; }
+        QLineEdit:focus { border-color: #147d83; }
+        QLineEdit:disabled { color: #a2adba; background: #f3f5f7; border-color: #e6eaf0; }
         QComboBox QAbstractItemView { background: white; selection-background-color: #e1f0ef;
                                      selection-color: #183547; }
         QCheckBox { spacing: 8px; }

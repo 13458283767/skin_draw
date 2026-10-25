@@ -1,0 +1,1116 @@
+{
+  "schema_version": "1.1",
+  "layout_id": "skin_layout_v3",
+  "coordinates": "body_oriented_row_col",
+  "flatten_order": "row_major",
+  "placement_mode": "body",
+  "view_positions": {
+    "1": {
+      "x": 9.193684489077086,
+      "y": 3.5
+    },
+    "2": {
+      "x": 15.806315510922914,
+      "y": 3.5
+    },
+    "3": {
+      "x": 19.840758821442652,
+      "y": 9.899799505583191
+    },
+    "4": {
+      "x": -1.000844906228167,
+      "y": 8.859758057353131
+    },
+    "5": {
+      "x": 0.7999999999999998,
+      "y": 14.939624517769499
+    },
+    "6": {
+      "x": 20.2,
+      "y": 14.939624517769499
+    },
+    "7": {
+      "x": 9.0,
+      "y": 10.21981225888475
+    },
+    "8": {
+      "x": 9.0,
+      "y": 16.9396245177695
+    }
+  },
+  "blocks": {
+    "1": {
+      "raw_rows": 5,
+      "raw_cols": 3,
+      "rows": 5,
+      "cols": 3,
+      "orientation": {
+        "rotation": 180,
+        "flip_x": true,
+        "flip_y": false
+      },
+      "saved_to_raw_index": [
+        [
+          12,
+          13,
+          14
+        ],
+        [
+          9,
+          10,
+          11
+        ],
+        [
+          6,
+          7,
+          8
+        ],
+        [
+          3,
+          4,
+          5
+        ],
+        [
+          0,
+          1,
+          2
+        ]
+      ],
+      "raw_valid_mask": [
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ]
+      ],
+      "valid_mask": [
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ]
+      ]
+    },
+    "2": {
+      "raw_rows": 5,
+      "raw_cols": 3,
+      "rows": 5,
+      "cols": 3,
+      "orientation": {
+        "rotation": 180,
+        "flip_x": true,
+        "flip_y": false
+      },
+      "saved_to_raw_index": [
+        [
+          12,
+          13,
+          14
+        ],
+        [
+          9,
+          10,
+          11
+        ],
+        [
+          6,
+          7,
+          8
+        ],
+        [
+          3,
+          4,
+          5
+        ],
+        [
+          0,
+          1,
+          2
+        ]
+      ],
+      "raw_valid_mask": [
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ]
+      ],
+      "valid_mask": [
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ]
+      ]
+    },
+    "3": {
+      "raw_rows": 7,
+      "raw_cols": 3,
+      "rows": 3,
+      "cols": 7,
+      "orientation": {
+        "rotation": 270,
+        "flip_x": true,
+        "flip_y": false
+      },
+      "saved_to_raw_index": [
+        [
+          0,
+          3,
+          6,
+          9,
+          12,
+          15,
+          18
+        ],
+        [
+          1,
+          4,
+          7,
+          10,
+          13,
+          16,
+          19
+        ],
+        [
+          2,
+          5,
+          8,
+          11,
+          14,
+          17,
+          20
+        ]
+      ],
+      "raw_valid_mask": [
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ]
+      ],
+      "valid_mask": [
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      ]
+    },
+    "4": {
+      "raw_rows": 7,
+      "raw_cols": 3,
+      "rows": 3,
+      "cols": 7,
+      "orientation": {
+        "rotation": 270,
+        "flip_x": true,
+        "flip_y": false
+      },
+      "saved_to_raw_index": [
+        [
+          0,
+          3,
+          6,
+          9,
+          12,
+          15,
+          18
+        ],
+        [
+          1,
+          4,
+          7,
+          10,
+          13,
+          16,
+          19
+        ],
+        [
+          2,
+          5,
+          8,
+          11,
+          14,
+          17,
+          20
+        ]
+      ],
+      "raw_valid_mask": [
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true
+        ]
+      ],
+      "valid_mask": [
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      ]
+    },
+    "5": {
+      "raw_rows": 7,
+      "raw_cols": 4,
+      "rows": 4,
+      "cols": 7,
+      "orientation": {
+        "rotation": 90,
+        "flip_x": false,
+        "flip_y": true
+      },
+      "saved_to_raw_index": [
+        [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24
+        ],
+        [
+          1,
+          5,
+          9,
+          13,
+          17,
+          21,
+          25
+        ],
+        [
+          2,
+          6,
+          10,
+          14,
+          18,
+          22,
+          26
+        ],
+        [
+          3,
+          7,
+          11,
+          15,
+          19,
+          23,
+          27
+        ]
+      ],
+      "raw_valid_mask": [
+        [
+          true,
+          false,
+          false,
+          false
+        ],
+        [
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          false,
+          false,
+          false
+        ]
+      ],
+      "valid_mask": [
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          false,
+          true,
+          true,
+          true,
+          true,
+          true,
+          false
+        ],
+        [
+          false,
+          true,
+          true,
+          true,
+          true,
+          true,
+          false
+        ],
+        [
+          false,
+          true,
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      ]
+    },
+    "6": {
+      "raw_rows": 7,
+      "raw_cols": 4,
+      "rows": 4,
+      "cols": 7,
+      "orientation": {
+        "rotation": 270,
+        "flip_x": true,
+        "flip_y": false
+      },
+      "saved_to_raw_index": [
+        [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24
+        ],
+        [
+          1,
+          5,
+          9,
+          13,
+          17,
+          21,
+          25
+        ],
+        [
+          2,
+          6,
+          10,
+          14,
+          18,
+          22,
+          26
+        ],
+        [
+          3,
+          7,
+          11,
+          15,
+          19,
+          23,
+          27
+        ]
+      ],
+      "raw_valid_mask": [
+        [
+          true,
+          false,
+          false,
+          false
+        ],
+        [
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          false,
+          false,
+          false
+        ]
+      ],
+      "valid_mask": [
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          false,
+          true,
+          true,
+          true,
+          true,
+          true,
+          false
+        ],
+        [
+          false,
+          true,
+          true,
+          true,
+          true,
+          true,
+          false
+        ],
+        [
+          false,
+          true,
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      ]
+    },
+    "7": {
+      "raw_rows": 10,
+      "raw_cols": 5,
+      "rows": 5,
+      "cols": 10,
+      "orientation": {
+        "rotation": 90,
+        "flip_x": true,
+        "flip_y": false
+      },
+      "saved_to_raw_index": [
+        [
+          49,
+          44,
+          39,
+          34,
+          29,
+          24,
+          19,
+          14,
+          9,
+          4
+        ],
+        [
+          48,
+          43,
+          38,
+          33,
+          28,
+          23,
+          18,
+          13,
+          8,
+          3
+        ],
+        [
+          47,
+          42,
+          37,
+          32,
+          27,
+          22,
+          17,
+          12,
+          7,
+          2
+        ],
+        [
+          46,
+          41,
+          36,
+          31,
+          26,
+          21,
+          16,
+          11,
+          6,
+          1
+        ],
+        [
+          45,
+          40,
+          35,
+          30,
+          25,
+          20,
+          15,
+          10,
+          5,
+          0
+        ]
+      ],
+      "raw_valid_mask": [
+        [
+          true,
+          true,
+          true,
+          false,
+          false
+        ],
+        [
+          true,
+          true,
+          true,
+          false,
+          false
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          false
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          false
+        ],
+        [
+          true,
+          true,
+          true,
+          false,
+          false
+        ],
+        [
+          true,
+          true,
+          true,
+          false,
+          false
+        ]
+      ],
+      "valid_mask": [
+        [
+          false,
+          false,
+          false,
+          true,
+          true,
+          true,
+          true,
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          false,
+          false
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      ]
+    },
+    "8": {
+      "raw_rows": 10,
+      "raw_cols": 5,
+      "rows": 5,
+      "cols": 10,
+      "orientation": {
+        "rotation": 90,
+        "flip_x": true,
+        "flip_y": false
+      },
+      "saved_to_raw_index": [
+        [
+          49,
+          44,
+          39,
+          34,
+          29,
+          24,
+          19,
+          14,
+          9,
+          4
+        ],
+        [
+          48,
+          43,
+          38,
+          33,
+          28,
+          23,
+          18,
+          13,
+          8,
+          3
+        ],
+        [
+          47,
+          42,
+          37,
+          32,
+          27,
+          22,
+          17,
+          12,
+          7,
+          2
+        ],
+        [
+          46,
+          41,
+          36,
+          31,
+          26,
+          21,
+          16,
+          11,
+          6,
+          1
+        ],
+        [
+          45,
+          40,
+          35,
+          30,
+          25,
+          20,
+          15,
+          10,
+          5,
+          0
+        ]
+      ],
+      "raw_valid_mask": [
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      ],
+      "valid_mask": [
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      ]
+    }
+  },
+  "created_at": "2026-10-20T17:01:55+08:00"
+}

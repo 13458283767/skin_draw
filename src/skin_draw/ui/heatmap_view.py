@@ -169,6 +169,7 @@ class HeatmapView(QWidget):
         self.orientations: dict[int, BlockOrientation] = {}
         self.sensor_masks = SensorMasks()
         self.manual_positions: dict[int, tuple[float, float]] = {}
+        self.reference_specs: tuple[BlockLayout, ...] = ()
         self.arrangement = None
         self.axis_labels = []
         box = QHBoxLayout(self)
@@ -274,6 +275,16 @@ class HeatmapView(QWidget):
         self.orientations[block_id] = orientation
         self._reflow(count_missing=False)
 
+    def apply_collection_preset(self, placement_mode, orientations, positions, reference_specs):
+        """Restore local placement and orientation without creating sensor measurements."""
+        self.block_drag.cancel()
+        self.placement_mode = placement_mode
+        self.orientations = dict(orientations)
+        self.manual_positions = dict(positions)
+        self.reference_specs = tuple(reference_specs)
+        self._last_reflow_key = None
+        self._reflow(count_missing=False)
+
     def _reflow(self, *, count_missing=True):
         if not self.auto_layout or self.frame is None or self.geometry_frame is None:
             return
@@ -284,12 +295,19 @@ class HeatmapView(QWidget):
         self.block_drag.cancel()
         self._last_reflow_key = key
         frame, selected = self.frame, self.reading(self.selected)
-        arrange = arrange_body if self.placement_mode == "body" else arrange_frame
-        self.arrangement = arrange(self.geometry_frame, self.view.width(), self.view.height(), self.orientations)
+        if self.placement_mode == "body":
+            self.arrangement = arrange_body(self.geometry_frame, self.view.width(), self.view.height(),
+                                           self.orientations, self.reference_specs)
+        else:
+            self.arrangement = arrange_frame(self.geometry_frame, self.view.width(), self.view.height(), self.orientations)
         if self.manual_positions:
             self.arrangement = replace(self.arrangement, blocks=tuple(
                 replace(spec, x=self.manual_positions[spec.block_id][0], y=self.manual_positions[spec.block_id][1])
                 if spec.block_id in self.manual_positions else spec for spec in self.arrangement.blocks))
+            if self.placement_mode == "body":
+                self.arrangement = replace(self.arrangement, slots=tuple(
+                    replace(spec, x=self.manual_positions[spec.block_id][0], y=self.manual_positions[spec.block_id][1])
+                    if spec.block_id in self.manual_positions else spec for spec in self.arrangement.slots))
         if signature == self._layout_signature and self.items:
             # Resize moves existing items; it never clears the visible scene.
             self._position_items(self.arrangement.blocks)
@@ -593,18 +611,34 @@ class HeatmapView(QWidget):
             item.show_values = enabled
             item.update()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Re-pack for the new viewport instead of stretching stale geometry: the
+        # caption space reserved by arrange_frame is expressed in cell units, so a
+        # size change without a reflow can make labels overlap or clip.
+        self._reflow(count_missing=False)
+
     def fit_view(self) -> None:
         if self.auto_layout and self.arrangement is not None and not self.manual_positions:
             self.view.setRange(QRectF(*self.arrangement.bounds), padding=0)
             self._update_annotations()
             return
-        if not self.layout_specs:
+        fit_specs = self.layout_specs
+        if self.auto_layout and self.placement_mode == "body" and self.arrangement is not None:
+            fit_specs = self.arrangement.slots
+        if not fit_specs:
             return
-        left = min(s.x for s in self.layout_specs) - .8
+        left = min(s.x for s in fit_specs) - .8
         title = self.arrangement.title_offset if self.arrangement else 1.0
-        top = min(s.y for s in self.layout_specs) - title - .6
-        right = max(s.x + s.display_shape[1] for s in self.layout_specs) + .5
-        bottom = max(s.y + s.display_shape[0] for s in self.layout_specs) + .5
+        top = min(s.y for s in fit_specs) - title - .6
+        right = max(s.x + s.display_shape[1] for s in fit_specs) + .5
+        bottom = max(s.y + s.display_shape[0] for s in fit_specs) + .5
+        # A live drag updates items immediately; placeholder slots refresh on reflow.
+        if self.layout_specs:
+            left = min(left, min(s.x for s in self.layout_specs) - .8)
+            top = min(top, min(s.y for s in self.layout_specs) - title - .6)
+            right = max(right, max(s.x + s.display_shape[1] for s in self.layout_specs) + .5)
+            bottom = max(bottom, max(s.y + s.display_shape[0] for s in self.layout_specs) + .5)
         if self.auto_layout and self.placement_mode == "body" and self.arrangement is not None:
             bx, by, bw, bh = self.arrangement.bounds
             left, top = min(left, bx), min(top, by)

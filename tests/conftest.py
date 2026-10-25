@@ -12,6 +12,8 @@ from skin_draw.ui.theme import apply_theme
 def isolated_sensor_config(tmp_path, monkeypatch):
     # Tests never load or overwrite the operator's saved sensor mapping.
     monkeypatch.setattr("skin_draw.ui.main_window.default_mask_path", lambda: tmp_path / "sensor_masks.json")
+    # Recording must never create samples inside the repository's dataset folder.
+    monkeypatch.setattr("skin_draw.ui.main_window.default_dataset_root", lambda: tmp_path / "dataset")
 
 
 @pytest.fixture(scope="session")

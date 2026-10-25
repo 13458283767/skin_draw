@@ -3,6 +3,7 @@
 from pathlib import Path
 from collections import deque
 from dataclasses import replace
+from datetime import datetime
 from math import ceil
 import logging
 
@@ -10,7 +11,7 @@ import numpy as np
 from time import perf_counter
 from PySide6.QtCore import QSignalBlocker, QTimer, Qt, Slot, QUrl
 from PySide6.QtGui import QAction, QKeySequence, QDesktopServices
-from PySide6.QtWidgets import (QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow,
+from PySide6.QtWidgets import (QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QMainWindow,
                                QMessageBox, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 
 from ..colors import ColorScale
@@ -18,9 +19,15 @@ from ..acquisition import Scan
 from ..models import Frame
 from ..mapping import BlockOrientation
 from ..sensor_masks import SensorMasks, default_mask_path
+from ..collection_activation import load_activation_policy
+from ..collection_layout import CollectionLayoutStore
+from ..collection_quality import LEVELS, QUALITY_NAMES, load_quality_policy
+from ..dataset import (MAX_ADC_COLUMNS, CalibrationSnapshot, DatasetStore, RawSampleRecorder,
+                       RecordingPlan, default_labels, layout_adc_columns)
 from ..transport import available_ports
 from ..simulator import demo_specs, generate_frame
 from .control_panel import ControlPanel, label
+from .collection_bar import CollectionBar
 from .heatmap_view import HeatmapView, SensorReading
 from .serial_worker import SerialWorker
 from .reception_rate_bar import ReceptionRateBar
@@ -38,8 +45,18 @@ logger = logging.getLogger(__name__)
 DISPLAY_INTERVAL_MS = 4
 
 
+def default_dataset_root() -> Path:
+    """Dataset folder next to logs/, outside the package so it can be copied as a whole."""
+    return Path(__file__).resolve().parents[3] / "dataset"
+
+
+def _default_session_id() -> str:
+    return f"session_{datetime.now():%Y%m%d}_01"
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, demo: bool = False, *, mask_path=None, raw_adc=False):
+    def __init__(self, demo: bool = False, *, mask_path=None, raw_adc=False, collection_layout_dir=None,
+                 dataset_dir=None):
         super().__init__()
         self.raw_adc = raw_adc
         self.mask_path = Path(mask_path) if mask_path is not None else default_mask_path()
@@ -50,6 +67,32 @@ class MainWindow(QMainWindow):
             self.sensor_masks = SensorMasks()
             self.mask_load_error = str(error)
             logger.exception("有效点位配置加载失败：%s", self.mask_path)
+        directory = Path(collection_layout_dir) if collection_layout_dir is not None else self.mask_path.parent / "collection_layouts"
+        self.collection_store = CollectionLayoutStore(directory)
+        self.collection_layout = None
+        self.collection_load_error = ""
+        try:
+            self.collection_layout = self.collection_store.load()
+        except (OSError, ValueError) as error:
+            self.collection_load_error = str(error)
+            logger.exception("采集布局加载失败：%s", directory)
+        self.collection_locked = self.collection_layout is not None
+        if self.collection_layout is not None:
+            self.sensor_masks = self.collection_layout.with_masks(self.sensor_masks)
+        # Training dataset. Startup only READS labels.json: neither the dataset
+        # folder nor any sample is created until the first recording starts.
+        self.dataset_store = DatasetStore(Path(dataset_dir) if dataset_dir is not None
+                                          else default_dataset_root())
+        self.dataset_labels = default_labels()
+        self.labels_error = ""
+        try:
+            self.dataset_labels = self.dataset_store.load_labels()
+        except (OSError, ValueError) as error:
+            self.labels_error = str(error)
+            logger.exception("动作类别表加载失败：%s", self.dataset_store.labels_path)
+        self.recorder = RawSampleRecorder()
+        self.recording_plan: RecordingPlan | None = None
+        self.last_sample = None
         self.setWindowTitle("SkinDraw · 原始 ADC 测试" if raw_adc else "SkinDraw · 电子皮肤热力图")
         self.resize(1250, 860)
         self.setMinimumSize(1000, 720)
@@ -93,6 +136,11 @@ class MainWindow(QMainWindow):
         self.logs_button.clicked.connect(self._open_logs)
         header.addWidget(self.logs_button)
         outer.addLayout(header)
+        # Recording UI sits above the heatmap frame: identity, boundary buttons and
+        # the counters required by the CSV plan.
+        self.collection_bar = CollectionBar()
+        self.collection_bar.set_actions(self.dataset_labels.classes)
+        outer.addWidget(self.collection_bar)
         body = QHBoxLayout()
         body.setSpacing(16)
         self.controls = ControlPanel(raw_adc=raw_adc)
@@ -117,6 +165,8 @@ class MainWindow(QMainWindow):
         card_box.addLayout(toolbar)
         self.heatmap = HeatmapView()
         self.heatmap.sensor_masks = self.sensor_masks
+        if self.collection_layout is not None:
+            self._apply_collection_view()
         card_box.addWidget(self.heatmap, 1)
         self.hover_label = label("移动鼠标查看传感器读数；单击锁定选点。")
         self.hover_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
@@ -154,7 +204,11 @@ class MainWindow(QMainWindow):
         self.reception_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.reception_timer.setInterval(1000)
         self.reception_timer.timeout.connect(self._refresh_reception_rate)
+        self.recording_timer = QTimer(self)
+        self.recording_timer.setInterval(100)
+        self.recording_timer.timeout.connect(self._refresh_recording)
         self._connect_controls()
+        self._init_recording_identity()
         self.heatmap.set_show_values(self.controls.show_values.isChecked())
         self._refresh_ports()
         if demo:
@@ -187,6 +241,7 @@ class MainWindow(QMainWindow):
         controls.refresh_ports.clicked.connect(self._refresh_ports)
         controls.connect_button.clicked.connect(self._connect_hardware)
         controls.recalibrate.clicked.connect(self._recalibrate)
+        controls.filter_toggle.toggled.connect(self._filter_changed)
         controls.direction.clicked.connect(self._toggle_direction)
         controls.normalize.toggled.connect(self._norm_changed)
         controls.norm_mode.currentIndexChanged.connect(self._norm_mode_changed)
@@ -199,6 +254,9 @@ class MainWindow(QMainWindow):
         controls.mirror_vertical.clicked.connect(lambda: self._orient_block("vertical"))
         controls.reset_orientation.clicked.connect(lambda: self._orient_block("reset"))
         controls.edit_sensor_mask.clicked.connect(self._edit_sensor_mask)
+        controls.save_collection_layout.clicked.connect(self._save_collection_layout)
+        controls.edit_collection_layout.clicked.connect(self._edit_collection_layout)
+        controls.restore_collection_layout.clicked.connect(self._restore_collection_layout)
         controls.demo_toggle.toggled.connect(self._toggle_demo)
         controls.preset.currentIndexChanged.connect(self._preset_changed)
         controls.palette.currentTextChanged.connect(self._update_scale)
@@ -215,6 +273,21 @@ class MainWindow(QMainWindow):
         self.heatmap.sensor_hovered.connect(self._hovered)
         self.heatmap.sensor_selected.connect(self._selected)
         self.heatmap.layout_changed.connect(self._layout_changed)
+        bar = self.collection_bar
+        bar.start.clicked.connect(self._start_recording)
+        bar.stop.clicked.connect(lambda: self.finish_recording("user_stop"))
+        bar.mark_valid.clicked.connect(lambda: self._mark_sample(True))
+        bar.mark_void.clicked.connect(lambda: self._mark_sample(False))
+        bar.dataset_button.clicked.connect(self._open_dataset)
+        # The trial number preview follows the identity fields, but is frozen while recording.
+        bar.subject.currentTextChanged.connect(self._subject_changed)
+        bar.session.currentTextChanged.connect(self._identity_changed)
+        bar.add_subject.clicked.connect(lambda: self._add_identity(False))
+        bar.add_session.clicked.connect(lambda: self._add_identity(True))
+        bar.delete_subject.clicked.connect(lambda: self._delete_identity(False))
+        bar.delete_session.clicked.connect(lambda: self._delete_identity(True))
+        bar.restore_identity.clicked.connect(self._restore_identity)
+        bar.action.currentIndexChanged.connect(self._refresh_trial_preview)
         for key, callback in (("Space", self.toggle_play), ("F", self.heatmap.fit_view)):
             action = QAction(self)
             action.setShortcut(QKeySequence(key))
@@ -254,11 +327,604 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 combo.setCurrentIndex(index)
         enabled = bool(specs) and self.heatmap.auto_layout
-        self.controls.edit_sensor_mask.setEnabled(bool(specs))
-        for widget in (combo, self.controls.rotate_left, self.controls.rotate_right,
+        combo.setEnabled(enabled)
+        self.controls.edit_sensor_mask.setEnabled(bool(specs) and not self.collection_locked
+                                                   and not self._recording_active())
+        for widget in (self.controls.rotate_left, self.controls.rotate_right,
                        self.controls.mirror_horizontal, self.controls.mirror_vertical,
                        self.controls.reset_orientation):
-            widget.setEnabled(enabled)
+            widget.setEnabled(enabled and not self.collection_locked and not self._recording_active())
+        self._update_collection_status()
+
+    def _update_collection_status(self):
+        specs = self.heatmap.layout_specs
+        layout = self.collection_layout
+        status_key = (layout.layout_id if layout else None, self.collection_locked,
+                      self.input_source, self.heatmap.auto_layout, self.collection_load_error,
+                      self.mask_load_error, self.heatmap.placement_mode, self._recording_active(),
+                      tuple((s.block_id, s.rows, s.cols, s.x, s.y) for s in specs))
+        if status_key == getattr(self, "_collection_status_key", None):
+            return
+        self._collection_status_key = status_key
+        controls = self.controls
+        is_demo = self.input_source == "demo"
+        usable = (bool(specs) and self.heatmap.auto_layout
+                  and self.input_source in ("hardware", "external", "stopped"))
+        positions_changed = self._collection_positions_changed()
+        controls.save_collection_layout.setEnabled(
+            usable and (not self.collection_locked or positions_changed) and not self._recording_active()
+            and not self.collection_load_error and not self.mask_load_error)
+        controls.edit_collection_layout.setEnabled(layout is not None and self.collection_locked
+                                                   and not is_demo and not self._recording_active())
+        controls.restore_collection_layout.setEnabled(
+            (layout is not None or bool(self.collection_load_error)) and not is_demo
+            and not self._recording_active())
+        problems = []
+        if layout is not None:
+            known = layout.by_id
+            for spec in specs:
+                block = known.get(spec.block_id)
+                if block is None:
+                    problems.append(f"{spec.block_id:02d} 未固定")
+                elif (spec.rows, spec.cols) != (block.spec.rows, block.spec.cols):
+                    problems.append(f"{spec.block_id:02d} 尺寸不符")
+        if self.collection_load_error:
+            text = f"采集布局加载失败，请修复配置后重启：{self.collection_load_error}"
+        elif is_demo:
+            text = "模拟演示不保存采集布局；请连接实际皮肤后保存。"
+        elif layout is None:
+            text = "尚未固定采集布局；调整方向和点位后点击保存。"
+        else:
+            revision = layout.layout_id.removeprefix("skin_layout_")
+            state = "已固定" if self.collection_locked else "调整中 · 请保存新版本"
+            if self.collection_locked and positions_changed:
+                state = "位置待保存"
+            text = f"{state} · 本地 {revision} · 已配置 {len(layout.blocks)}/14 块"
+            if not layout.view_positions:
+                text += "\n旧版未记录摆放位置，调整后保存一次即可记住。"
+            missing = sorted(set(range(1, 15)) - set(layout.by_id))
+            if missing:
+                text += "\n待配置：" + "、".join(map(str, missing))
+            if problems:
+                text += "\n" + "；".join(problems) + "，请调整并重新保存。"
+        controls.collection_layout_status.setText(text)
+        controls.collection_layout_status.setToolTip(str(self.collection_store.directory))
+        controls.collection_layout_status.setStyleSheet(
+            "color: #b45309" if self.collection_load_error or problems else "")
+
+    def _collection_positions_changed(self):
+        if self.collection_layout is None:
+            return False
+        positions = self.collection_layout.positions
+        return (self.heatmap.placement_mode != self.collection_layout.placement_mode
+                or any(positions.get(spec.block_id) != (spec.x, spec.y) for spec in self.heatmap.layout_specs))
+
+    def _init_recording_identity(self):
+        bar = self.collection_bar
+        if self.labels_error:
+            bar.set_status(f"动作类别表不可用，采集功能已禁用：{self.labels_error}", "error")
+        self._refresh_identity_choices(initial=True)
+        self._refresh_trial_preview()
+        self._refresh_recording_availability()
+
+    @staticmethod
+    def _fill_identity_combo(combo, names, selected):
+        # 批量刷新时屏蔽中间空值信号，避免受试者切换过程中读到错误场次。
+        with QSignalBlocker(combo):
+            combo.clear()
+            combo.addItems(names)
+            combo.setCurrentText(selected)
+
+    def _refresh_identity_choices(self, subject=None, session=None, *, initial=False):
+        bar = self.collection_bar
+        try:
+            subjects = self.dataset_store.list_subjects()
+            if subject is None:
+                subject = subjects[0] if subjects else ("student01" if initial else "")
+            sessions = self.dataset_store.list_sessions(subject) if subject else []
+            if session is None:
+                session = _default_session_id() if initial else (sessions[-1] if sessions else "")
+            self._fill_identity_combo(bar.subject, subjects, subject)
+            self._fill_identity_combo(bar.session, sessions, session)
+            self._identity_changed()
+        except (OSError, ValueError) as error:
+            bar.set_status(f"读取受试者列表失败：{error}", "error")
+
+    def _subject_changed(self, *_):
+        if self._recording_active():
+            return
+        bar = self.collection_bar
+        try:
+            subject = bar.subject.currentText().strip()
+            sessions = self.dataset_store.list_sessions(subject) if subject else []
+        except (OSError, ValueError):
+            sessions = []
+        self._fill_identity_combo(bar.session, sessions, sessions[-1] if sessions else _default_session_id())
+        self._identity_changed()
+
+    def _identity_changed(self, *_):
+        bar = self.collection_bar
+        active = self._recording_active()
+        try:
+            subject = bar.subject.currentText().strip()
+            subjects = self.dataset_store.list_subjects()
+            sessions = self.dataset_store.list_sessions(subject) if subject in subjects else []
+        except (OSError, ValueError):
+            subjects, sessions = [], []
+        bar.add_subject.setEnabled(not active)
+        bar.delete_subject.setEnabled(not active and subject in subjects)
+        bar.add_session.setEnabled(not active and subject in subjects)
+        bar.delete_session.setEnabled(not active and bar.session.currentText().strip() in sessions)
+        self._refresh_trial_preview()
+        self._refresh_recording_availability()
+
+    def _add_identity(self, is_session):
+        if self._recording_active():
+            return
+        bar = self.collection_bar
+        subject = bar.subject.currentText().strip()
+        title = "场次" if is_session else "受试者"
+        try:
+            prefix = _default_session_id().rsplit("_", 1)[0] + "_" if is_session else "student"
+            suggestion = self.dataset_store.next_identity(prefix, subject if is_session else None)
+            name, accepted = QInputDialog.getText(self, f"新增{title}", f"{title}编号：", text=suggestion)
+            if not accepted:
+                return
+            # 对话框期间仍可能收到界面事件，落盘前再次检查录制边界。
+            if self._recording_active():
+                raise ValueError("正在采集，不能新增受试者或场次")
+            name = name.strip()
+            if is_session:
+                self.dataset_store.create_session(subject, name)
+                self._refresh_identity_choices(subject, name)
+            else:
+                self.dataset_store.create_subject(name)
+                self._refresh_identity_choices(name)
+            bar.set_status(f"已新增{title}：{name}", "ok")
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, f"无法新增{title}", str(error))
+
+    def delete_selected_identity(self, is_session=False):
+        """删除当前选项并自动收缩列表，已保存的其他编号和标签保持不变。"""
+        if self._recording_active():
+            raise ValueError("正在采集，不能删除受试者或场次")
+        bar = self.collection_bar
+        subject = bar.subject.currentText().strip()
+        session = bar.session.currentText().strip() if is_session else None
+        source = self.dataset_store.root / subject
+        if session is not None:
+            source = source / session
+        archive = self.dataset_store.archive_identity(subject, session)
+        # 清掉指向已回收样本的操作，防止“标记有效”继续访问旧路径。
+        if self.last_sample is not None and self.last_sample.sample_dir.resolve().is_relative_to(source.resolve()):
+            self.last_sample = None
+            self.recording_plan = None
+            bar.set_sample_state("未判定")
+            bar.set_stats(0., 0, {})
+        self._refresh_identity_choices(subject if is_session else None)
+        self._refresh_recording_availability()
+        bar.set_status(f"已移入回收目录：{subject}" + (f" / {session}" if is_session else ""), "ok")
+        bar.status.setToolTip(str(archive))
+        return archive
+
+    def _delete_identity(self, is_session):
+        try:
+            self.delete_selected_identity(is_session)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "无法删除", str(error))
+
+    def _restore_identity(self):
+        if self._recording_active():
+            return
+        try:
+            entries = self.dataset_store.archived_identities()
+            if not entries:
+                self.collection_bar.set_status("回收目录为空，没有待恢复的数据")
+                return
+            choices = [f"{info['original_path']} · {info['deleted_at']} · {key[:8]}"
+                       for key, info in entries]
+            selected, accepted = QInputDialog.getItem(self, "恢复删除", "选择要恢复的受试者、场次或作废样本：",
+                                                     choices, 0, False)
+            if not accepted or self._recording_active():
+                return
+            parts = self.dataset_store.restore_identity(entries[choices.index(selected)][0])
+            self._refresh_identity_choices(*parts[:2])
+            self.collection_bar.set_status("已恢复：" + " / ".join(parts), "ok")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            QMessageBox.warning(self, "无法恢复", str(error))
+
+    def _selected_action(self):
+        actions = self.dataset_labels.by_id()
+        action = actions.get(self.collection_bar.action_id())
+        if action is None:
+            raise ValueError("请选择动作类别")
+        return action
+
+    def _recording_active(self):
+        return self.recorder.active
+
+    def _refresh_trial_preview(self, *_):
+        if self._recording_active():
+            return
+        bar = self.collection_bar
+        try:
+            subject = bar.subject.currentText().strip()
+            session = bar.session.currentText().strip()
+            action = self._selected_action()
+            number = self.dataset_store.next_trial_number(subject, session, action)
+            bar.set_trial(f"{action.name}{number:03d}",
+                          f"当前场次「{action.display_name}」的下一条样本编号；已存在样本不会覆盖")
+        except (OSError, ValueError):
+            bar.set_trial("—", "请先填写受试者、场次并选择动作")
+
+    def _refresh_recording_availability(self):
+        bar = self.collection_bar
+        if self._recording_active():
+            bar.start.setEnabled(False)
+            return
+        ready = (self.worker is not None and self.input_source == "hardware"
+                 and self.collection_layout is not None and self.collection_locked
+                 and not self.labels_error and bool(bar.subject.currentText().strip())
+                 and bool(bar.session.currentText().strip()))
+        bar.start.setEnabled(ready)
+        # Never replace the message of a just-finished sample with an availability hint.
+        if ready or self.last_sample is not None:
+            return
+        if self.labels_error:
+            bar.set_status(f"动作类别表不可用，采集功能已禁用：{self.labels_error}", "error")
+        elif self.worker is None:
+            bar.set_status("未开始 · 连接硬件后可采集训练样本")
+        elif self.collection_layout is None:
+            bar.set_status("未开始 · 尚未固定采集布局", "warn")
+
+    def _check_recording_shapes(self, layout):
+        """Reject a start that the fixed layout cannot describe."""
+        if self.worker is None:
+            return
+        with self.worker.buffer.lock:
+            blocks = dict(self.worker.buffer.blocks)
+        for key, block in blocks.items():
+            saved = layout.by_id.get(key)
+            if saved is not None and block.values.shape != (saved.spec.rows, saved.spec.cols):
+                raise ValueError(f"BLOCK {key:02d} 当前尺寸与固定布局不符，请重新保存采集布局")
+        if not set(blocks) & set(layout.by_id):
+            raise ValueError("固定布局中的皮肤块尚未收到数据，请等待首帧后再开始采集")
+
+    def _capture_calibration(self, subject, session, layout):
+        """Snapshot the running baseline; raw ADC mode has no baseline to reference."""
+        if self.raw_adc or self.worker is None:
+            return None
+        baselines, samples = self.worker.buffer.baseline_snapshot()
+        known = layout.by_id
+        usable = {key: matrix for key, matrix in baselines.items()
+                  if key in known and matrix.shape == (known[key].spec.rows, known[key].spec.cols)}
+        if not usable:
+            return None
+        snapshot = CalibrationSnapshot.from_baselines(
+            self.dataset_store.next_calibration_id(subject, session),
+            datetime.now().astimezone().isoformat(timespec="milliseconds"), usable, calib_samples=samples)
+        if not snapshot.baselines:
+            return None
+        self.dataset_store.save_calibration(subject, session, snapshot)
+        return snapshot
+
+    def start_recording(self):
+        """Begin one action sample; identity is locked until ``finish_recording``."""
+        if self._recording_active():
+            raise ValueError("上一段样本尚未结束")
+        if self.labels_error:
+            raise ValueError(f"动作类别表不可用：{self.labels_error}")
+        if self.worker is None or self.input_source != "hardware":
+            raise ValueError("请先连接实际皮肤；模拟数据不能保存为训练样本")
+        layout = self.collection_layout
+        if layout is None or not self.collection_locked:
+            raise ValueError("请先保存并固定采集布局，再开始采集")
+        bar = self.collection_bar
+        subject = bar.subject.currentText().strip()
+        session = bar.session.currentText().strip()
+        action = self._selected_action()
+        self.dataset_store.session_path(subject, session)  # validates the two directory names
+        self._check_recording_shapes(layout)
+        quality_policy = load_quality_policy(self.mask_path.parent / "collection_quality.json")
+        activation_policy = load_activation_policy(self.mask_path.parent / "collection_activation.json")
+        cadence = self.worker.buffer.recording_cadence(tuple(layout.by_id), quality_policy)
+        columns = layout_adc_columns(layout)
+        if not 1 <= columns <= MAX_ADC_COLUMNS:
+            raise ValueError("固定布局中没有可采集的点数")
+        number = self.dataset_store.next_trial_number(subject, session, action)
+        trial_id = f"{action.name}{number:03d}"
+        # Global files first: labels, layout version and the session manifest must
+        # exist before the sample references them.
+        self.dataset_store.ensure_labels(self.dataset_labels)
+        self.dataset_store.ensure_layout(layout)
+        self.dataset_store.open_session(
+            subject_id=subject, session_id=session, layout=layout, labels=self.dataset_labels,
+            max_adc_columns=columns, expected_block_ids=tuple(layout.by_id),
+            transport=self._session_transport())
+        calibration = self._capture_calibration(subject, session, layout)
+        plan = RecordingPlan(
+            sample_dir=self.dataset_store.root / subject / session / action.name / trial_id,
+            subject_id=subject, session_id=session, trial_id=trial_id, action=action,
+            layout=layout, labels_id=self.dataset_labels.labels_id,
+            expected_block_ids=tuple(layout.by_id), max_adc_columns=columns,
+            calibration=calibration, quality_policy=quality_policy,
+            activation_policy=activation_policy, cadence_references=cadence)
+        self.recorder.start(plan)
+        self.recording_plan = plan
+        self.last_sample = None
+        self.recording_timer.start()
+        bar.set_recording(True)
+        bar.set_trial(trial_id, "本条样本编号（编号冻结，结束后自动指向下一条）")
+        bar.set_sample_state("录制中", "warn")
+        bar.set_stats(0., 0, {})
+        bar.set_integrity(self.recorder.snapshot().integrity)
+        bar.set_status(f"录制中 · {subject} / {session} / {trial_id}；结束后先完成写盘再开始下一条", "warn")
+        self._layout_changed()  # reapplies the editing locks for the recording state
+        event(logger, logging.INFO, "开始采集训练样本", subject_id=subject, session_id=session,
+              trial_id=trial_id, action_id=action.id, layout_id=layout.layout_id,
+              max_adc_columns=columns, calibration_id=calibration.calibration_id if calibration else None)
+        return plan
+
+    def attach_recording_sink(self, buffer):
+        """Offer this buffer's raw blocks to the recorder (also used by tests)."""
+        buffer.set_raw_sink(self.recorder.submit)
+
+    def _session_transport(self):
+        controls = self.controls
+        return {"transport": "serial", "port": controls.port.currentData(),
+                "baudrate": controls.baudrate.currentData(),
+                "receive_mode": controls.receive_mode.currentData(),
+                "protocol": controls.protocol.currentData()}
+
+    def finish_recording(self, reason="user_stop", *, notify=True):
+        """Close the sample boundary, drain the writer, then refresh index.csv."""
+        if not self._recording_active():
+            return None
+        self.recording_timer.stop()
+        result = self.recorder.stop(reason)
+        self.last_sample = result
+        self.collection_bar.set_recording(False)
+        index_error = ""
+        if result is not None and not result.meta_error:
+            try:
+                self.dataset_store.rebuild_index()
+            except OSError as error:
+                index_error = str(error)
+                logger.exception("样本清单刷新失败")
+        self._show_sample_result(result, index_error)
+        # 手动输入的新编号在首次录制后也需要加入下拉列表，重启可直接选择。
+        self._refresh_identity_choices(self.collection_bar.subject.currentText(),
+                                       self.collection_bar.session.currentText())
+        self._layout_changed()
+        self._refresh_recording_availability()
+        event(logger, logging.INFO, "结束采集训练样本", reason=reason,
+              status=getattr(result, "status", None), records=getattr(result, "records", None),
+              written=getattr(result, "written_records", None),
+              missing=list(getattr(result, "missing_block_ids", ())),
+              sample=str(result.sample_dir) if result is not None else None)
+        if notify and result is not None and result.status != "complete":
+            QMessageBox.warning(self, "样本未完整保存",
+                                "样本已保留但标记为未完成，不会自动进入正常训练集合。\n"
+                                f"原因：{result.end_reason}\n目录：{result.sample_dir}")
+        return result
+
+    def _show_sample_result(self, result, index_error=""):
+        bar = self.collection_bar
+        if result is None:
+            bar.set_status("结束采集时未能取得样本结果，请检查日志", "error")
+            bar.set_sample_state("未知", "error")
+            return
+        bar.set_stats(result.duration_s, result.records, result.frames_by_block, result.missing_block_ids)
+        bar.set_integrity(result.integrity)
+        trial = result.sample_dir.name
+        if result.status == "complete" and not result.meta_error:
+            integrity = result.integrity or {}
+            semantic = result.semantic or {}
+            quality = integrity.get("status", "pending")
+            if semantic.get("status") in LEVELS and LEVELS[semantic["status"]] > LEVELS.get(quality, 0):
+                quality = semantic["status"]
+            reasons = list(integrity.get("reasons", [])) + list(semantic.get("reasons", []))
+            detail = "；".join(reasons[:2])
+            activation = result.activation or {}
+            region = f" · 区域 {activation.get('region_set') or '-'}（{activation.get('region_count', 0)} 块）"
+            bar.set_status(f"已保存 {trial} · {result.duration_s:.1f} 秒 · {QUALITY_NAMES[quality]}"
+                           + region + (f" · {detail}" if detail else " · 待人工确认动作"),
+                           "error" if quality == "fail" else ("warn" if quality == "warn" else "ok"))
+            bar.set_sample_state("不合格" if quality == "fail" else "未判定", "error" if quality == "fail" else "warn",
+                                 can_accept=quality != "fail", can_void=True)
+        else:
+            reasons = []
+            if result.meta_error:
+                reasons.append(result.meta_error)
+            if result.missing_block_ids:
+                reasons.append("缺失 BLOCK " + "、".join(map(str, result.missing_block_ids)))
+            if result.written_records != result.records:
+                reasons.append(f"只写入 {result.written_records}/{result.records} 行")
+            if result.errors:
+                reasons.append(f"{len(result.errors)} 项数据异常")
+            bar.set_status(f"未完成 {trial}（{result.end_reason}）：" + "；".join(reasons or ["请检查日志"]), "error")
+            bar.set_sample_state("未完成", "error", can_void=result.meta_path is not None)
+        bar.status.setToolTip(str(result.sample_dir) + "\n" + "\n".join(result.integrity.get("reasons", [])))
+        if index_error:
+            bar.set_status(bar.status.text() + f" · index.csv 未刷新：{index_error}", "error")
+
+    def _refresh_recording(self):
+        if not self._recording_active():
+            self.recording_timer.stop()
+            return
+        stats = self.recorder.snapshot()
+        self.collection_bar.set_stats(stats.duration_s, stats.records, stats.frames_by_block)
+        self.collection_bar.set_integrity(stats.integrity)
+        # 单块时间空缺继续保留其他块；磁盘已失败时及时结束本段。
+        if stats.fatal_error:
+            self.finish_recording("write_error", notify=False)
+            return
+        plan = self.recording_plan
+        detail = (f"录制中 · {plan.subject_id} / {plan.session_id} / {plan.trial_id}"
+                  if plan is not None else "录制中")
+        if plan is not None:
+            detail += f" · 已收 {len(stats.frames_by_block)}/{len(plan.expected_block_ids)} 块"
+        if stats.dropped:
+            detail += f" · 队列丢弃 {stats.dropped} 行"
+        if stats.errors:
+            detail += f" · {len(stats.errors)} 项异常（结束时标为未完成）"
+        quality = stats.integrity.get("status", "pass")
+        if stats.integrity.get("reasons"):
+            detail += " · " + stats.integrity["reasons"][0]
+        self.collection_bar.set_status(detail, "error" if quality == "fail" else "warn")
+
+    def _start_recording(self):
+        try:
+            self.start_recording()
+        except (OSError, ValueError) as error:
+            logger.exception("未能开始采集")
+            QMessageBox.warning(self, "无法开始采集", str(error))
+
+    def mark_sample_accepted(self, accepted):
+        """有效样本留在正式目录；作废样本整体回收，避免训练时误读。"""
+        if self._recording_active():
+            raise ValueError("正在录制，不能标记样本")
+        result = self.last_sample
+        if result is None or result.meta_path is None or not Path(result.meta_path).exists():
+            raise ValueError("没有可标记的已结束样本")
+        if accepted:
+            self.dataset_store.update_accepted(result.meta_path, accepted)
+            self.dataset_store.rebuild_index()
+            self.collection_bar.set_sample_state("有效", "ok")
+        else:
+            archive = self.dataset_store.archive_sample(result.meta_path)
+            # 已移动的样本不再作为“本次”操作目标，防止重复作废或标记有效。
+            self.last_sample = None
+            self.collection_bar.set_sample_state("已作废", "idle")
+            self.collection_bar.set_status("已作废：本次样本已移出正式数据集，可通过“恢复删除”找回", "ok")
+            self.collection_bar.setToolTip(f"本次样本回收位置：{archive}")
+            self._refresh_trial_preview()
+
+    def _mark_sample(self, accepted):
+        try:
+            self.mark_sample_accepted(accepted)
+        except (OSError, ValueError) as error:
+            logger.exception("样本标记失败")
+            QMessageBox.warning(self, "样本未标记", str(error))
+
+    def _open_dataset(self):
+        try:
+            self.dataset_store.root.mkdir(parents=True, exist_ok=True)
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.dataset_store.root))):
+                raise OSError(f"无法打开数据集目录：{self.dataset_store.root}")
+        except OSError as error:
+            logger.exception("打开数据集目录失败")
+            QMessageBox.warning(self, "数据集目录", str(error))
+
+    def save_collection_layout(self):
+        """Snapshot the actual UI permutation, never its preprocessed sample values."""
+        if self._recording_active():
+            raise ValueError("正在采集，不能修改采集布局；请先结束采集")
+        if self.collection_load_error or self.mask_load_error:
+            raise ValueError("配置加载失败，请先修复配置后重启，未覆盖已有文件")
+        if self.collection_locked and not self._collection_positions_changed():
+            raise ValueError("采集布局已固定；需要修改时先点击“调整采集布局”")
+        if self.input_source not in ("hardware", "external", "stopped") or not self.heatmap.auto_layout:
+            raise ValueError("请先连接实际皮肤并调整方向；模拟数据不能保存为采集布局")
+        specs = self.heatmap.layout_specs
+        if self.worker is not None:
+            with self.worker.buffer.lock:
+                for spec in specs:
+                    block = self.worker.buffer.blocks.get(spec.block_id)
+                    if block is None or block.values.shape != (spec.rows, spec.cols):
+                        raise ValueError("硬件尺寸正在变化，请等待界面更新后重新保存")
+        saved = self.collection_store.save(specs, self.sensor_masks, previous=self.collection_layout,
+                                          placement_mode=self.heatmap.placement_mode)
+        self.collection_layout = saved
+        self.collection_locked = True
+        self._apply_collection_view()
+        self._layout_changed()
+        self._refresh_recording_availability()
+        event(logger, logging.INFO, "采集布局已保存并固定", layout_id=saved.layout_id,
+              block_ids=list(saved.by_id), path=str(self.collection_store.directory))
+        return saved
+
+    def _save_collection_layout(self):
+        try:
+            self.save_collection_layout()
+        except (OSError, ValueError) as error:
+            logger.exception("采集布局未保存")
+            QMessageBox.warning(self, "采集布局未保存", str(error))
+
+    def _edit_collection_layout(self):
+        if self._recording_active():
+            return
+        if self.collection_layout is None or self.input_source == "demo":
+            return
+        self.collection_locked = False
+        self._layout_changed()
+
+    def _restore_collection_layout(self):
+        if self._recording_active() or self.input_source == "demo":
+            return
+        # Re-read disk, including any newer version saved since this window started.
+        try:
+            loaded = self.collection_store.load()
+            if loaded is None:
+                raise ValueError("本地还没有采集布局，请先调整并保存")
+            if self.mask_load_error:
+                raise ValueError("有效点位配置加载失败，请修复后重启")
+            updated = loaded.with_masks(self.sensor_masks)
+            changed_ids = {
+                block.spec.block_id for block in loaded.blocks
+                if not np.array_equal(self.sensor_masks.get(block.spec.block_id, (block.spec.rows, block.spec.cols)),
+                                      np.asarray(block.raw_valid_mask))
+            }
+            updated.save(self.mask_path)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "采集布局未恢复", str(error))
+            return
+        self.collection_layout = loaded
+        self.collection_load_error = ""
+        self.sensor_masks = updated
+        self.heatmap.set_sensor_masks(updated)
+        if changed_ids:
+            self.pending_live_info = None
+            self.live_info_state = None
+            if self.worker is not None:
+                for block_id in changed_ids:
+                    self.worker.buffer.set_sensor_masks(updated, block_id)
+                self._request_live_update()
+            if self.display_values is not None and not self.raw_adc:
+                self.display_values = {key: value for key, value in self.display_values.items() if key not in changed_ids}
+            if not self.raw_adc:
+                self.controls.calibration_progress.setValue(0)
+                self.controls.calibration_status.setText("已恢复有效点位；变更的皮肤块需重新标定")
+                self.controls.calibration_details.hide()
+        self.collection_locked = True
+        self._apply_collection_view()
+        frame = self.current_frame if self.current_frame is not None else Frame(())
+        self._display_frame(frame, self.display_values)
+        self._layout_changed()
+        self._refresh_recording_availability()
+
+    def _apply_collection_view(self):
+        layout = self.collection_layout
+        known = layout.by_id
+        orientations = {key: block.orientation for key, block in known.items()}
+        for spec in self.heatmap.layout_specs:
+            saved = known.get(spec.block_id)
+            if saved is None or (spec.rows, spec.cols) != (saved.spec.rows, saved.spec.cols):
+                orientations[spec.block_id] = BlockOrientation()
+        self.heatmap.apply_collection_preset(
+            layout.placement_mode, orientations, layout.positions, tuple(block.spec for block in layout.blocks))
+
+    def _prepare_collection_directions(self, blocks):
+        if not self.collection_locked or self.input_source == "demo":
+            return
+        known = self.collection_layout.by_id
+        for block in blocks:
+            saved = known.get(block.block_id)
+            if saved is not None and block.values.shape == (saved.spec.rows, saved.spec.cols):
+                self.heatmap.orientations[block.block_id] = saved.orientation
+            else:
+                # A changed device must not be displayed as if its old mapping were verified.
+                self.heatmap.orientations[block.block_id] = BlockOrientation()
 
     def _orientation_target_changed(self, *_):
         block_id = self.controls.orientation_block.currentData()
@@ -267,6 +933,8 @@ class MainWindow(QMainWindow):
                 self.heatmap.select_sensor(self.heatmap.first_sensor(block_id))
 
     def _edit_sensor_mask(self):
+        if self.collection_locked:
+            return
         block_id = self.controls.orientation_block.currentData()
         if block_id not in self.heatmap.items:
             return
@@ -284,6 +952,10 @@ class MainWindow(QMainWindow):
 
     def apply_sensor_mask(self, block_id, mask):
         """Persist before committing to worker/view, on the GUI thread."""
+        if self._recording_active():
+            raise ValueError("正在采集，不能修改有效点位；请先结束采集")
+        if self.collection_locked:
+            raise ValueError("采集布局已固定，请先点击“调整采集布局”")
         if self.mask_load_error:
             raise ValueError(f"原点位配置加载失败，未覆盖原文件。请先修复配置后重启：\n{self.mask_path}")
         item = self.heatmap.items.get(block_id)
@@ -323,6 +995,8 @@ class MainWindow(QMainWindow):
               shape=np.asarray(mask).shape, valid=int(np.asarray(mask).sum()), path=str(self.mask_path))
 
     def _orient_block(self, action):
+        if self.collection_locked or self._recording_active():
+            return
         block_id = self.controls.orientation_block.currentData()
         if block_id not in self.heatmap.items or not self.heatmap.auto_layout:
             return
@@ -350,6 +1024,7 @@ class MainWindow(QMainWindow):
 
     def _display_frame(self, frame: Frame, display_values=None, *, changed_ids=None, refresh_statistics=True):
         layout_blocks = tuple(self.live_blocks.values()) if self.input_source in ("hardware", "stopped") else None
+        self._prepare_collection_directions(layout_blocks if layout_blocks is not None else frame.blocks)
         # Cache before set_frame: the heatmap re-emits the selected reading
         # while refreshing, and the detail panel reads this cache.
         self.display_values = display_values
@@ -357,6 +1032,7 @@ class MainWindow(QMainWindow):
                                self.live_missing_counts if layout_blocks is not None else None,
                                changed_ids=changed_ids)
         self.current_frame = frame
+        self._update_collection_status()
         if refresh_statistics:
             self._refresh_statistics()
         if self.controls.auto_levels.isChecked():
@@ -511,7 +1187,7 @@ class MainWindow(QMainWindow):
         base = None if baseline is None else float(baseline[reading.row, reading.col])
         if state.norm == "none":
             if shown is not None and np.isfinite(shown):
-                parts.append(f"滤波 {shown:.1f}")
+                parts.append(f"{'滤波' if state.filter_enabled else 'ADC'} {shown:.1f}")
         else:
             if base is not None and np.isfinite(base):
                 parts.append(f"基线 {base:.1f}")
@@ -552,12 +1228,13 @@ class MainWindow(QMainWindow):
             self.controls.connection_status.setText("未发现串口，请接入 USB-RS485 后刷新")
 
     def _toggle_demo(self, enabled):
-        if self.worker is not None:
+        if self.worker is not None or self._recording_active():
             return
         self.reception_bar.set_idle("模拟模式 · 不统计接收" if enabled else "未连接硬件")
         self.pending_live_info = None
         self.live_info_state = None
         self.controls.demo_panel.setVisible(enabled)
+        self.controls.filter_toggle.setEnabled(not enabled and not self.raw_adc)
         self.controls.recalibrate.setEnabled(False)
         self.preprocess = None
         self.live_blocks.clear()
@@ -575,10 +1252,16 @@ class MainWindow(QMainWindow):
             self.controls.calibration_status.setText("收到首帧立即绘图，无需校准。" if self.raw_adc else
                                                      "连接后保持无按压，约3秒自动标定完成")
             self._display_frame(Frame(()))
+        self._refresh_recording_availability()
 
     def _connect_hardware(self):
         if self.worker is not None:
             logger.info("用户点击断开硬件")
+            # A disconnect ends the open sample first: the CSV boundary must not
+            # outlive the data source, and the writer has to drain before restart.
+            if self._recording_active():
+                self.finish_recording("disconnect", notify=False)
+            self.collection_bar.start.setEnabled(False)
             self.pending_live_info = None
             self.accept_scans = False
             self.worker.stop()
@@ -631,8 +1314,11 @@ class MainWindow(QMainWindow):
                                    direction=direction,
                                    protocol=self.controls.protocol.currentData(),
                                    baudrate=self.controls.baudrate.currentData(),
-                                   raw_adc=self.raw_adc, norm=self._active_norm())
+                                   raw_adc=self.raw_adc, norm=self._active_norm(),
+                                   filter_enabled=self.controls.filter_toggle.isChecked())
         self.worker.buffer.set_sensor_masks(self.sensor_masks)
+        # Raw blocks are offered to the recorder before any display preprocessing.
+        self.attach_recording_sink(self.worker.buffer)
         self.worker.status_changed.connect(self._serial_status)
         self.worker.failed.connect(self._serial_failed)
         self.worker.data_ready.connect(self._request_live_update, Qt.ConnectionType.QueuedConnection)
@@ -645,6 +1331,7 @@ class MainWindow(QMainWindow):
                        self.controls.receive_mode, self.controls.protocol, self.controls.baudrate):
             widget.setEnabled(False)
         self.worker.start()
+        self._refresh_recording_availability()
 
     @Slot()
     def _request_live_update(self):
@@ -726,6 +1413,7 @@ class MainWindow(QMainWindow):
                      tuple(sorted(snapshot.missing_counts.items())),
                      snapshot.preprocess.ready, snapshot.preprocess.progress,
                      snapshot.preprocess.norm, snapshot.preprocess.direction,
+                     snapshot.preprocess.filter_enabled,
                      tuple(sorted(snapshot.preprocess.samples.items())),
                      bool(scan.protocol_errors))
         refresh_info = snapshot is None or state != self.live_info_state
@@ -786,6 +1474,8 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _serial_failed(self, message):
+        if self._recording_active():
+            self.finish_recording("disconnect", notify=False)
         self.accept_scans = False
         self.display_timer.stop()
         self.reception_timer.stop()
@@ -794,9 +1484,14 @@ class MainWindow(QMainWindow):
         logger.error("采集失败通知：%s", message)
         self.controls.connection_status.setText(message)
         self.source_badge.setText("采集失败 · 画面非实时")
+        self._refresh_recording_availability()
 
     @Slot()
     def _worker_finished(self):
+        # The worker is gone: close the sample so the writer drains and meta.json
+        # records why the recording ended instead of leaving it "recording".
+        if self._recording_active():
+            self.finish_recording("disconnect", notify=False)
         self.reception_timer.stop()
         self.reception_bar.set_idle("采集已停止")
         self._flush_live()
@@ -819,6 +1514,7 @@ class MainWindow(QMainWindow):
         self.controls.calibration_status.setText("已断开；下次连接直接显示原始 ADC" if self.raw_adc else "已断开；下次连接将重新自动标定")
         self.controls.calibration_details.hide()
         self._update_status()
+        self._refresh_recording_availability()
         if worker:
             worker.deleteLater()
         if self.close_when_stopped:
@@ -856,6 +1552,19 @@ class MainWindow(QMainWindow):
             self.worker.buffer.set_direction(direction)
             self._request_live_update()
         self.controls.direction.setText("受压变小 ↓  · 点击切换" if direction == -1 else "受压变大 ↑  · 点击切换")
+
+    def _filter_changed(self, enabled):
+        """按钮只控制 M3；归一化选项和训练录制的原始数据保持独立。"""
+        if self.raw_adc:
+            return
+        self.controls.filter_toggle.setText(
+            "M3 滤波：开启 · 点击关闭" if enabled else "M3 滤波：关闭 · 点击开启")
+        # 丢弃待显示的旧状态；后台切换会清空基线，并从下一帧重新标定。
+        self.pending_live_info = None
+        self.live_info_state = None
+        if self.worker is not None:
+            self.worker.buffer.set_filter_enabled(enabled)
+            self._request_live_update()
 
     def _active_norm(self):
         """Current normalization mode from the two controls (B 为默认推荐)."""
@@ -940,6 +1649,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         logger.info("关闭窗口 requested worker_active=%s", self.worker is not None)
+        if self._recording_active():
+            # Close the boundary and drain the CSV before the process can exit.
+            self.finish_recording("app_exit", notify=False)
         self.timer.stop()
         self.display_timer.stop()
         self.health_timer.stop()
