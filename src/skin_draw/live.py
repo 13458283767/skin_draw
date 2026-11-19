@@ -1,4 +1,4 @@
-"""Delivery-pack preprocessing (M3 -> slow baseline -> normalization) on the worker thread.
+"""Preprocessing (M3 -> fixed baseline -> normalization) on the worker thread.
 
 The serial thread owns ingestion: every received block advances its
 BlockPreprocessor. The GUI takes bounded snapshots; slow paints cannot drop
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class PreprocessState:
-    """Latest M3 + slow-baseline + normalization state, for the GUI."""
+    """Latest M3 + fixed-baseline + normalization state, for the GUI."""
     ready: bool
     progress: int
     message: str
@@ -34,6 +34,8 @@ class PreprocessState:
     baselines: dict[int, np.ndarray]                  # read-only baseline matrices, for the selected-point detail
     samples: dict[int, int]                           # per-block calibration samples, for the progress detail
     filter_enabled: bool = True                       # snapshot 与显示值使用同一滤波状态
+    baseline_issue: str = ""                          # 标定闸门拒绝原因；空串表示正常
+    baseline_warning: str = ""                        # 不阻断的提醒，如重新贴附后的基线跳变
 
 
 @dataclass(frozen=True)
@@ -101,11 +103,11 @@ class LiveBuffer:
             fps = self._measured_fps(key)
             preprocessor = BlockPreprocessor(shape, self.sensor_masks.get(key, shape),
                                              norm=self.norm, direction=_direction_name(self.direction),
-                                             fps=fps, calib_n=self.calib_n,
+                                             calib_n=self.calib_n,
                                              filter_enabled=self.filter_enabled)
             self.preprocessors[key] = preprocessor
             event(logger, logging.INFO, "皮肤块预处理已启动", block_id=key, shape=tuple(shape),
-                  fps=round(fps, 1), upd_n=preprocessor.upd_n, norm=self.norm)
+                  fps=round(fps, 1), baseline_mode="calib", norm=self.norm)
         return preprocessor
 
     def receive(self, block: Block):
@@ -159,11 +161,10 @@ class LiveBuffer:
                     continue
                 # Rebuild in place: the edited block must immediately report as
                 # not ready instead of disappearing from the aggregate state.
-                fps = self._measured_fps(key)
                 self.preprocessors[key] = BlockPreprocessor(
                     block.values.shape, self.sensor_masks.get(key, block.values.shape),
                     norm=self.norm, direction=_direction_name(self.direction),
-                    fps=fps, calib_n=self.calib_n, filter_enabled=self.filter_enabled)
+                    calib_n=self.calib_n, filter_enabled=self.filter_enabled)
             self.dirty = True
             if keys:
                 event(logger, logging.INFO, "更新有效点位，重新自动标定对应皮肤块", blocks=keys)
@@ -185,7 +186,8 @@ class LiveBuffer:
         with self.lock:
             logger.info("重置滤波与基线，重新自动标定")
             for preprocessor in self.preprocessors.values():
-                preprocessor.reset()
+                # 用户主动重置：保留上一代基线，下次标定才能发现“重新贴附”
+                preprocessor.reset(keep_reference=True)
             self.display_values.clear()
             self.dirty = True
 
@@ -238,29 +240,41 @@ class LiveBuffer:
         if self.norm == "none":
             return ("归一化已关闭 · 显示 M3 滤波原值" if self.filter_enabled else
                     "归一化已关闭 · 显示原始 ADC（滤波关闭）")
+        # 闸门拒绝时优先说明原因：用户需要知道“标定还没完成”而不是“还在等数据”。
+        blocker = next(((key, item) for key, item in sorted(self.preprocessors.items())
+                        if item.baseline_issue), None)
+        if blocker is not None:
+            key, item = blocker
+            tail = "；确认无接触后点“重置滤波与基线”" if item.baseline_blocked else "；请松开后等待重新标定"
+            return f"标定未通过 · BLOCK {key:02d} {item.baseline_issue}{tail}"
         if all(preprocessor.ready for preprocessor in preprocessors):
-            return "自动标定完成 · 慢跟踪运行中（长按可能缓慢回落）"
+            warning = next((item.baseline_warning for item in preprocessors if item.baseline_warning), "")
+            return "自动标定完成 · 基线已固定" + (f" · {warning}" if warning else "")
         return "自动标定中 · 请保持无按压（约3秒）"
 
     def _preprocess_state(self):
         if self.raw_adc:
             return PreprocessState(True, 100, "原始 ADC 模式 · 不扣基线", self.direction, "none",
-                                   self.calib_n, {}, {}, False)
+                                   self.calib_n, {}, {}, False, "", "")
         keys = sorted(self.preprocessors)
         preprocessors = [self.preprocessors[key] for key in keys]
         ready = bool(preprocessors) and all(preprocessor.ready for preprocessor in preprocessors)
         progress = min((preprocessor.progress for preprocessor in preprocessors), default=0)
+        issue = next((f"BLOCK {key:02d} {self.preprocessors[key].baseline_issue}"
+                      for key in keys if self.preprocessors[key].baseline_issue), "")
+        warning = next((f"BLOCK {key:02d} {self.preprocessors[key].baseline_warning}"
+                        for key in keys if self.preprocessors[key].baseline_warning), "")
         return PreprocessState(ready, progress, self._message(preprocessors), self.direction, self.norm,
                                self.calib_n,
                                {key: self.preprocessors[key].baselines for key in keys},
                                {key: self.preprocessors[key].samples for key in keys},
-                               self.filter_enabled)
+                               self.filter_enabled, issue, warning)
 
     def baseline_snapshot(self):
         """Copy the current raw-order baselines for a sample's calibration_id.
 
         Returns (``{block_id: matrix}``, minimum calibration samples). Matrices are
-        copies, so later slow-tracker updates cannot rewrite an already saved
+        copies, so later recalibration cannot rewrite an already saved
         sample; blocks whose baseline is still incomplete are omitted instead of
         being stored as fabricated zeros.
         """

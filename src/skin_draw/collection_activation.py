@@ -22,8 +22,14 @@ ACTIVATION_VERSION = "contact_activation_v1"
 class ActivationPolicy:
     """每段录制开始时冻结，并随 meta.json 保存；允许通过配置调整。"""
 
-    # 单点相对标定基线的下降量超过该值，才算该块"被接触"。
+    # 单点相对标定基线的下降量超过该值，才算该块"被接触"（区域判定）。
     threshold_counts: float = 100.
+    # 起点阈值：取较低值，宁可早一点开工，能抓住握持、推压这类缓爬坡的起步。
+    onset_counts: float = 20.
+    # 终点阈值与"是否仍在接触"的阈值：余振和漂移实测可达 29 ADC，不能再降。
+    edge_counts: float = 50.
+    # 端点外扩：正值在自动起止两侧各加一段，用于对齐人工标注习惯。0 表示不外扩。
+    edge_pad_s: float = 0.
     # 多区域动作（拥抱）至少要同时接触的区域数。
     hug_min_regions: int = 3
     # 单区域动作允许的主接触块切换次数。
@@ -31,9 +37,17 @@ class ActivationPolicy:
     multi_region_actions: tuple[str, ...] = ("hug",)
 
     def __post_init__(self):
-        if (type(self.threshold_counts) not in (int, float)
-                or not math.isfinite(self.threshold_counts) or self.threshold_counts <= 0):
-            raise ValueError("接触判定阈值必须为有限正数")
+        for name in ("threshold_counts", "onset_counts", "edge_counts"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"接触判定阈值 {name} 必须为有限正数")
+        if self.onset_counts > self.edge_counts:
+            raise ValueError("起点阈值不能高于终点阈值")
+        if self.edge_counts > self.threshold_counts:
+            raise ValueError("终点阈值不能高于区域判定阈值")
+        if (type(self.edge_pad_s) not in (int, float) or not math.isfinite(self.edge_pad_s)
+                or not 0 <= self.edge_pad_s <= 2):
+            raise ValueError("端点外扩必须为 0～2 秒的有限数")
         for name in ("hug_min_regions", "max_block_switches"):
             value = getattr(self, name)
             if type(value) is not int or not 0 <= value <= 32:
@@ -62,7 +76,12 @@ def load_activation_policy(path) -> ActivationPolicy:
 
 
 class ActivationTracker:
-    """由录制器在同一把锁内逐帧调用；只累加每块最大响应，不做显示滤波。"""
+    """由录制器在同一把锁内逐帧调用；只累加每块最大响应，不做显示滤波。
+
+    除区域摘要外，还记录首个与最后一个超过阈值的帧时刻，作为接触起止的自动初值。
+    这些时刻是"可测响应"区间，不等于皮肤真实接触区间：短促动作的松开拖尾会被
+    计入终点，因此仍需人工确认或至少按同一规则裁剪。
+    """
 
     def __init__(self, blocks, calibration, policy: ActivationPolicy):
         self.policy = policy
@@ -74,6 +93,12 @@ class ActivationTracker:
         self._frames_evaluated = 0
         self._previous_block: int | None = None
         self._current: dict[int, float] = {}
+        # 起止：只对"确实被接触过"的块（峰值达到终点阈值）采信，
+        # 避免噪声块或余振把区间拉长；没接触的块即使超过起点阈值也不参与。
+        self._onset: dict[int, float] = {}
+        self._offset: dict[int, float] = {}
+        self._contact_frames = 0
+        self._last_above_edge: dict[int, bool] = {}
         self.ready = bool(blocks)
         for key, block in blocks.items():
             mask = np.asarray(block.transform(np.asarray(block.raw_valid_mask)), dtype=bool).ravel()
@@ -96,8 +121,12 @@ class ActivationTracker:
             self._frames[key] = 0
             self._current[key] = 0.
 
-    def observe(self, key, values):
-        """记录一帧。``values`` 必须已是保存方向的行优先展开值。"""
+    def observe(self, key, values, time_s=0.):
+        """记录一帧。``values`` 必须已是保存方向的行优先展开值。
+
+        ``time_s`` 是该帧相对录制起点的时间；用它记录接触起止，缺省为 0 时
+        只累计区域摘要，不产生有意义的起止。
+        """
         if not self.ready:
             return
         baseline, mask = self._baseline.get(key), self._mask.get(key)
@@ -113,6 +142,15 @@ class ActivationTracker:
             return
         self._frames[key] += 1
         self._frames_evaluated += 1
+        moment = float(time_s)
+        if not math.isfinite(moment):
+            return
+        self._last_above_edge[key] = peak >= self.policy.edge_counts
+        if peak >= self.policy.onset_counts:
+            self._onset.setdefault(key, moment)
+        if peak >= self.policy.edge_counts:
+            self._offset[key] = moment
+            self._contact_frames += 1
         if peak > self._max_delta[key]:
             self._max_delta[key] = peak
         self._current[key] = peak
@@ -128,6 +166,11 @@ class ActivationTracker:
         regions = [key for key in sorted(self._max_delta)
                    if self._max_delta[key] >= self.policy.threshold_counts]
         primary = max(self._max_delta, key=lambda item: self._max_delta[item]) if regions else None
+        # 起止只在被接触过的块上取：峰值达终点阈值的块，才允许把区间向外撑。
+        touched = [key for key in self._max_delta
+                   if self._max_delta[key] >= self.policy.edge_counts]
+        starts = [self._onset[key] for key in touched if key in self._onset]
+        ends = [self._offset[key] for key in touched if key in self._offset]
         return {
             "method": ACTIVATION_VERSION,
             "available": self.ready,
@@ -140,6 +183,15 @@ class ActivationTracker:
                                  for key, value in sorted(self._max_delta.items())},
             "block_switches": self._switches,
             "frames_evaluated": self._frames_evaluated,
+            # 接触起止的自动初值：首/末个越过阈值的帧时刻，端点本身也被包含。
+            "contact_start_s": round(min(starts), 6) if starts else None,
+            "contact_end_s": round(max(ends), 6) if ends else None,
+            "contact_frames": self._contact_frames,
+            "onset_counts": self.policy.onset_counts,
+            "edge_counts": self.policy.edge_counts,
+            "edge_pad_s": self.policy.edge_pad_s,
+            # 结束时仍有被接触块高于终点阈值：松开段没录到，自动区间不可信。
+            "open_at_end": bool(any(self._last_above_edge.get(key, False) for key in touched)),
         }
 
 

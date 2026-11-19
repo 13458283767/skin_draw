@@ -1,4 +1,4 @@
-"""Training-sample recording for docs/训练数据采集与存储方案_CSV版.md.
+"""Training-sample recording for docs/训练数据采集与存储方案.md.
 
 The recording path is deliberately independent of Qt and of the display
 preprocessing chain. Raw parsed blocks arrive on the serial thread, are
@@ -9,9 +9,11 @@ readings: whatever the hardware returned is what the file contains.
 Concurrency contract
 --------------------
 ``submit`` is called from the serial thread and never raises. ``start``,
-``stop`` and ``snapshot`` are called from the GUI thread. ``stop`` flips the
-accept flag under the same lock as ``submit`` and only then drains the queue,
-so a late block can never leak into the next sample's file.
+``seal`` and ``snapshot`` are called from the GUI thread. ``seal`` flips the
+accept flag under the same lock as ``submit``; the background finalizer then
+calls ``stop`` to drain the queue. No new trial may start before it finishes,
+so a late block can never leak into the next sample's file. Direct non-UI
+callers may still use synchronous ``stop`` (which seals first).
 
 Data contract
 -------------
@@ -37,7 +39,9 @@ from time import perf_counter
 
 import numpy as np
 
-from .collection_activation import ActivationPolicy, ActivationTracker, semantic_status
+from .collection_activation import (ACTIVATION_VERSION, ActivationPolicy, ActivationTracker,
+                                    semantic_status)
+from .collection_baseline import TrialBaseline, TrialBaselinePolicy, validate_reference
 from .collection_layout import CollectionBlock, CollectionLayout
 from .collection_quality import LEVELS, IntegrityMonitor, QualityPolicy
 
@@ -161,16 +165,16 @@ class CalibrationSnapshot:
     """One static baseline snapshot referenced by the sample's calibration_id.
 
     Baselines are stored in raw hardware row/column order. They are a snapshot,
-    not a full history of the running slow tracker; a sample reproduces the
+    not a new per-trial no-contact calibration; a sample reproduces the
     baseline that was active when recording started, nothing more.
     """
 
     calibration_id: str
     captured_at: str
     baselines: dict[int, tuple[tuple[float | None, ...], ...]]
-    method: str = "runtime_slow_tracking_snapshot"
+    method: str = "runtime_fixed_baseline_snapshot"
     coordinates: str = "raw_row_col"
-    baseline_mode: str = "slow"
+    baseline_mode: str = "calib"
     calib_samples: int = 0
 
     def to_dict(self):
@@ -218,6 +222,7 @@ class RecordingPlan:
     quality_policy: QualityPolicy = field(default_factory=QualityPolicy)
     activation_policy: ActivationPolicy = field(default_factory=ActivationPolicy)
     cadence_references: tuple[tuple[int, float | None, int], ...] = ()
+    trial_baseline_policy: TrialBaselinePolicy | None = None
 
     def __post_init__(self):
         for name, value in (("subject_id", self.subject_id), ("session_id", self.session_id),
@@ -247,6 +252,8 @@ class RecordingPlan:
                 raise ValueError("接收参考编号或样本数无效")
         object.__setattr__(self, "cadence_references", references)
         IntegrityMonitor(ids, self.quality_policy, references)  # 写文件前验证冻结规则。
+        if self.trial_baseline_policy is not None:
+            validate_reference(self.blocks, self.calibration)
 
 
 @dataclass(frozen=True)
@@ -260,6 +267,7 @@ class RecordingStats:
     errors: tuple[str, ...]
     integrity: dict = field(default_factory=dict)
     fatal_error: str = ""
+    baseline: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -278,6 +286,7 @@ class SampleResult:
     integrity: dict = field(default_factory=dict)
     activation: dict = field(default_factory=dict)
     semantic: dict = field(default_factory=dict)
+    baseline: dict = field(default_factory=dict)
 
 
 class _SampleWriter:
@@ -360,13 +369,16 @@ class _SampleWriter:
     def finish(self):
         if self._thread is None:
             return
-        try:
-            self.queue.put(None, timeout=5)
-        except Full:
-            self.error = self.error or "写盘队列拥塞，未能排空"
-        self._thread.join(15)
-        if self._thread.is_alive():
-            self.error = self.error or "写盘线程未在 15 秒内结束"
+        # Called by the collection finalizer, never by a UI stop handler. Keep
+        # ownership until the writer really exits; a timeout must not make a
+        # still-open file appear ready for replay, deletion or a second trial.
+        while self._thread.is_alive():
+            try:
+                self.queue.put(None, timeout=.1)
+                break
+            except Full:
+                continue
+        self._thread.join()
         self._thread = None
 
 
@@ -394,10 +406,26 @@ class RawSampleRecorder:
         self.last_result: SampleResult | None = None
         self._integrity = None
         self._activation: ActivationTracker | None = None
+        self.preview_queue = None  # Optional, lossy display queue; never the CSV queue.
+        self._sealed = False
+        self._stop_clock = 0.
+        self._trial_baseline = None
+        self._action_allowed_s = None
 
     @property
     def active(self) -> bool:
-        return self._accepting
+        return self._accepting or self._sealed
+
+    def seal(self):
+        """Close the receive boundary immediately, without waiting for disk I/O."""
+        with self._lock:
+            if not self._accepting:
+                return False
+            self._accepting = False
+            self._sealed = True
+            self._stop_clock = self.clock()
+            self._ended_at = self.wall_clock().isoformat(timespec="milliseconds")
+            return True
 
     def _error_locked(self, message):
         self._error_count += 1
@@ -408,7 +436,7 @@ class RawSampleRecorder:
         if not isinstance(plan, RecordingPlan):
             raise ValueError("录制计划无效")
         with self._lock:
-            if self._accepting:
+            if self._accepting or self._sealed or self._writer is not None:
                 raise ValueError("上一段样本尚未结束")
             if plan.sample_dir.exists():
                 # Re-recording never overwrites; the caller must pick a new trial id.
@@ -418,7 +446,9 @@ class RawSampleRecorder:
         plan.sample_dir.mkdir(parents=True, exist_ok=False)
         writer = _SampleWriter(plan.sample_dir / "raw.csv", header)
         integrity = IntegrityMonitor(plan.expected_block_ids, plan.quality_policy, plan.cadence_references)
-        activation = ActivationTracker(plan.blocks, plan.calibration, plan.activation_policy)
+        activation = (None if plan.trial_baseline_policy is not None else
+                      ActivationTracker(plan.blocks, plan.calibration, plan.activation_policy))
+        trial_baseline = None
         try:
             writer.start()
             started_at = self.wall_clock().isoformat(timespec="milliseconds")
@@ -426,6 +456,8 @@ class RawSampleRecorder:
                              {}, {}, {}, {}, [], (), writer, 0,
                              integrity=integrity.evaluate(0.), activation={},
                              semantic=semantic_status({}, plan.action.name, plan.activation_policy))
+            if plan.trial_baseline_policy is not None:
+                trial_baseline = TrialBaseline(plan.blocks, plan.calibration, plan.trial_baseline_policy)
         except BaseException:
             writer.finish()
             raise
@@ -438,7 +470,10 @@ class RawSampleRecorder:
             self._errors, self._error_count = [], 0
             self._integrity = integrity
             self._activation = activation
+            self._trial_baseline = trial_baseline
+            self._action_allowed_s = None
             self._accepting = True
+            self._sealed = False
             self.last_result = None
 
     def submit(self, block, received_at):
@@ -490,6 +525,15 @@ class RawSampleRecorder:
             if not writer.submit(row):
                 self._error_locked("写盘队列已满或已失败，该帧未保存")
                 return
+            # Only a non-blocking reference handoff after the authoritative CSV
+            # enqueue. The row is immutable from here. Display overload is lossy;
+            # full review is rebuilt from the closed CSV instead.
+            preview = self.preview_queue
+            if preview is not None:
+                try:
+                    preview.put_nowait(row)
+                except Full:
+                    pass
             key = block.block_id
             self._records += 1
             self._last_time = time_s
@@ -501,8 +545,29 @@ class RawSampleRecorder:
                 self._first_time[key] = time_s
             self._last_block_time[key] = time_s
             self._integrity.receive(key, time_s)
+            if self._trial_baseline is not None:
+                self._trial_baseline.observe(key, time_s, raw)
             if self._activation is not None:
-                self._activation.observe(key, ordered)
+                if self._action_allowed_s is None or time_s >= self._action_allowed_s:
+                    # 同一帧同时用于区域统计与接触起止自动初值。
+                    self._activation.observe(key, ordered, time_s)
+
+    def _baseline_status_locked(self, duration):
+        baseline = self._trial_baseline
+        if baseline is None:
+            return {}
+        baseline.advance(duration)
+        report = baseline.result
+        if report is None:
+            return {"status": "collecting" if baseline.collecting else "processing",
+                    "window_end_s": baseline.policy.duration_s}
+        if report["status"] == "ready" and self._action_allowed_s is None:
+            self._activation = ActivationTracker(self._plan.blocks, baseline.calibration,
+                                                 self._plan.activation_policy)
+            # The GUI timer is about to display the cue. Do not backdate it to 1 s.
+            self._action_allowed_s = round(duration, 6)
+        return {"status": report["status"], "window_end_s": baseline.policy.duration_s,
+                "action_allowed_s": self._action_allowed_s, "reasons": report["reasons"]}
 
     def snapshot(self) -> RecordingStats:
         with self._lock:
@@ -516,20 +581,21 @@ class RawSampleRecorder:
                 fatal = fatal or "写盘队列溢出"
             failures = ([fatal] if fatal else []) + list(self._errors)
             integrity = self._integrity.evaluate(duration, failures=failures) if self._accepting else {}
+            baseline = self._baseline_status_locked(duration) if self._accepting else {}
             return RecordingStats(self._accepting, round(duration, 2), self._records,
                                   dict(self._frames), missing,
                                   self._writer.dropped if self._writer else 0, tuple(self._errors),
-                                  integrity, fatal)
+                                  integrity, fatal, baseline)
 
     def stop(self, reason="user_stop"):
         """Close the boundary, drain the writer, then finalise meta.json."""
+        self.seal()
         with self._lock:
-            if not self._accepting:
+            if not self._sealed:
                 return None
-            self._accepting = False
             plan, writer = self._plan, self._writer
-            duration = max(0., self.clock() - self._started_clock)
-            ended_at = self.wall_clock().isoformat(timespec="milliseconds")
+            duration = max(0., self._stop_clock - self._started_clock)
+            ended_at = self._ended_at
             records = self._records
             frames = dict(self._frames)
             first_time = dict(self._first_time)
@@ -538,10 +604,18 @@ class RawSampleRecorder:
             errors = tuple(self._errors)
             integrity_monitor = self._integrity
             activation_tracker = self._activation
+            trial_baseline = self._trial_baseline
+            action_allowed_s = self._action_allowed_s
         try:
             writer.finish()
         except OSError as error:
             writer.error = writer.error or f"排空写盘队列失败：{error}"
+        baseline_report = {}
+        if trial_baseline is not None:
+            baseline_report = dict(trial_baseline.finish(duration))
+            baseline_report["action_allowed_s"] = action_allowed_s
+            if baseline_report["status"] == "ready" and action_allowed_s is None:
+                baseline_report.update(status="failed", reasons=["结束前尚未发出可以开始动作的提示"])
         missing = tuple(key for key in plan.expected_block_ids if not frames.get(key))
         written = writer.written
         problems = []
@@ -553,6 +627,8 @@ class RawSampleRecorder:
             problems.append("data_anomaly")
         if missing:
             problems.append("missing_block")
+        if baseline_report and baseline_report["status"] != "ready":
+            problems.append("baseline_failed")
         if reason != "user_stop":
             problems.append("abnormal_end")
         status = "complete" if not problems else "incomplete"
@@ -561,19 +637,24 @@ class RawSampleRecorder:
         end_reason = reason if reason != "user_stop" else (problems[0] if problems else "user_stop")
         failure_names = {"write_error": "文件写入或关闭失败", "queue_overflow": "写盘队列溢出",
                          "data_anomaly": "存在未正常保存的数据帧", "missing_block": "预期皮肤块整段缺失",
+                         "baseline_failed": "逐条基线不合格：" + "；".join(baseline_report.get("reasons", [])),
                          "abnormal_end": f"录制异常结束：{reason}"}
         # 用接纳边界的结束时刻检查尾部，磁盘排空耗时不计为传感器断流。
         integrity = integrity_monitor.evaluate(duration, final=True,
                                                failures=[failure_names[key] for key in problems])
         activation = activation_tracker.summary() if activation_tracker is not None else {}
         semantic = semantic_status(activation, plan.action.name, plan.activation_policy)
+        annotation = auto_annotation(activation, duration, ended_at, action_allowed_s)
         meta_error = ""
         meta_path = plan.sample_dir / "meta.json"
         try:
+            if baseline_report:
+                atomic_write_json(plan.sample_dir / "baseline.json", baseline_report)
             self._write_meta(plan, status, end_reason, self._started_at, ended_at, duration,
                              frames, first_time, last_time, max_gap, missing, errors, writer,
                              written, max(0, records - written), integrity=integrity,
-                             activation=activation, semantic=semantic)
+                             activation=activation, semantic=semantic, baseline=baseline_report,
+                             annotation=annotation)
         except (OSError, ValueError) as error:
             meta_error = f"元数据写入失败：{error}"
             status = "incomplete"
@@ -582,17 +663,22 @@ class RawSampleRecorder:
             integrity["reasons"].append(meta_error)
         with self._lock:
             self._plan = None
-            self._writer = None
+            # A stuck writer keeps the recorder locked against another start.
+            if writer._thread is None:
+                self._writer = None
+            self._sealed = False
             self._activation = None
+            self._trial_baseline = None
         result = SampleResult(plan.sample_dir, status, end_reason, round(duration, 3), records, written,
                               frames, missing, errors, meta_path, meta_error, integrity,
-                              activation, semantic)
+                              activation, semantic, baseline_report)
         self.last_result = result
         return result
 
     def _write_meta(self, plan, status, end_reason, started_at, ended_at, duration,
                     frames, first_time, last_time, max_gap, missing, errors, writer,
-                    written, unwritten=0, *, integrity, activation=None, semantic=None):
+                    written, unwritten=0, *, integrity, activation=None, semantic=None, baseline=None,
+                    annotation=None):
         rates = {}
         for key, count in frames.items():
             span = last_time.get(key, 0.) - first_time.get(key, 0.)
@@ -605,7 +691,7 @@ class RawSampleRecorder:
         if semantic_status_name in LEVELS and LEVELS[semantic_status_name] > LEVELS.get(quality_status, 0):
             quality_status = semantic_status_name
         payload = {
-            "schema_version": "1.2",
+            "schema_version": "1.4" if plan.trial_baseline_policy is not None else "1.3",
             "subject_id": plan.subject_id,
             "session_id": plan.session_id,
             "trial_id": plan.trial_id,
@@ -623,8 +709,10 @@ class RawSampleRecorder:
             "flatten_order": "row_major",
             "max_adc_columns": plan.max_adc_columns,
             "expected_block_ids": list(plan.expected_block_ids),
-            # Action boundaries are a human annotation, never the button times.
-            "annotation": {"scope": "trial", "action_start_s": None, "action_end_s": None},
+            # Action boundaries: auto-detected first, manual confirmation replaces it.
+            "annotation": annotation or {"scope": "trial", "action_start_s": None,
+                                         "action_end_s": None, "status": "unlabeled",
+                                         "source": None},
             "recording_status": status,
             "quality_status": quality_status,
             "end_reason": end_reason,
@@ -650,6 +738,14 @@ class RawSampleRecorder:
             },
             "notes": "原始 ADC 未滤波、未扣基线；有效点位与通道映射见 layout_id 指向的布局文件",
         }
+        if plan.trial_baseline_policy is not None:
+            report = baseline or {"status": "collecting", "window_start_s": 0.,
+                                  "window_end_s": plan.trial_baseline_policy.duration_s,
+                                  "action_allowed_s": None, "reasons": []}
+            payload["baseline"] = {key: report.get(key) for key in
+                                   ("status", "window_start_s", "window_end_s", "action_allowed_s", "reasons")}
+            payload["baseline"].update(file="baseline.json", method="initial_raw_median_v1",
+                                       coordinates="raw_row_col", frozen_within_trial=True)
         atomic_write_json(plan.sample_dir / "meta.json", payload)
 
 
@@ -954,6 +1050,32 @@ class DatasetStore:
                     numbers.append(int(match.group(1)))
         return max(numbers, default=0) + 1
 
+    def update_annotation(self, meta_path, start_s, end_s):
+        """Atomically save human contact boundaries; never change raw or acceptance."""
+        meta_path = Path(meta_path).resolve()
+        parts = meta_path.relative_to(self.root.resolve()).parts
+        if len(parts) != 5 or parts[-1] != "meta.json" or parts[0].startswith("_"):
+            raise ValueError("标注路径不属于正式样本")
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+               for v in (start_s, end_s)):
+            raise ValueError("接触起止必须是有限秒数")
+        data = read_json(meta_path)
+        if data.get("recording_status") not in ("complete", "incomplete"):
+            raise ValueError("原始文件尚未完成写入，不能确认标注")
+        if not 0 <= start_s < end_s <= float(data.get("duration_s", 0)):
+            raise ValueError("必须满足 0 ≤ 接触开始 < 接触结束 ≤ 录制时长")
+        baseline = data.get("baseline", {})
+        if baseline.get("status") == "ready" and start_s < baseline["action_allowed_s"]:
+            raise ValueError("接触开始早于可以开始动作的提示；请检查提前接触并重采")
+        previous = data.get("annotation", {})
+        if previous.get("status") in ("confirmed", "auto"):
+            data.setdefault("annotation_history", []).append(previous)
+        data["annotation"] = {"scope": "trial", "action_start_s": float(start_s),
+                              "action_end_s": float(end_s), "status": "confirmed",
+                              "source": "manual", "updated_at": self._now_iso()}
+        atomic_write_json(meta_path, data)
+        return data
+
     def update_accepted(self, meta_path, accepted, reject_reason=""):
         meta_path = Path(meta_path)
         data = read_json(meta_path)
@@ -1014,3 +1136,38 @@ def layout_adc_columns(layout: CollectionLayout) -> int:
     """Largest flattened point count of any configured block, fixed per session."""
     return max((rows * cols for rows, cols in (block.spec.display_shape for block in layout.blocks)),
                default=0)
+
+
+def auto_annotation(activation, duration, updated_at="", gate_s=None):
+    """把接触检测的首末帧转成标注初值；边界不成立时返回 None，保持未标注。
+
+    这是"可测响应"区间，不是皮肤真实接触区间：端点受阈值与拖尾影响，
+    因此 status 记为 auto 而不是 confirmed，人工确认后会被覆盖并留下历史。
+    ``gate_s`` 是动作提示时刻，外扩后的起点不能早于它。
+    """
+    if not activation or not activation.get("available"):
+        return None
+    start = activation.get("contact_start_s")
+    end = activation.get("contact_end_s")
+    if start is None or end is None:
+        return None
+    limit = float(duration)
+    pad = float(activation.get("edge_pad_s") or 0.)
+    start = float(start) - pad
+    end = float(end) + pad
+    if gate_s is not None:
+        start = max(start, float(gate_s))
+    start = max(start, 0.)
+    end = min(end, limit)
+    if not start < end:
+        # 单帧响应或时间落在录制边界外：不刮造区间，留给人工判断。
+        return None
+    return {"scope": "trial", "action_start_s": round(start, 6),
+            "action_end_s": round(end, 6),
+            "status": "auto", "source": ACTIVATION_VERSION, "updated_at": updated_at,
+            "auto": {"threshold_counts": activation.get("threshold_counts"),
+                     "onset_counts": activation.get("onset_counts"),
+                     "edge_counts": activation.get("edge_counts"),
+                     "edge_pad_s": pad,
+                     "contact_frames": activation.get("contact_frames"),
+                     "open_at_end": bool(activation.get("open_at_end"))}}

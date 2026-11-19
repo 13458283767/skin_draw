@@ -1,11 +1,11 @@
-"""单测：交付包预处理链路（M3 滤波 -> slow 基线 -> 归一化 A/B/none）。"""
+"""单测：M3 滤波 -> 固定基线 -> 归一化 A/B/none。"""
 
 import random
 
 import numpy as np
 import pytest
 
-from skin_draw.preprocessing import BaselineTracker, BlockPreprocessor, PointFilter
+from skin_draw.preprocessing import BaselineGate, BaselineTracker, BlockPreprocessor, PointFilter
 
 
 def feed(pre, values, frames=1):
@@ -31,17 +31,19 @@ def test_delivery_scenario_direction_and_scale():
     assert abs(results[430]) < 0.02          # 滑窗排空后回到 0
 
 
-def test_delivery_scenario_slow_self_heals_startup_convergence():
-    """场景2：前 600 帧悬空 4070 后落到 2500，slow 慢跟踪自动校正。"""
-    rng = random.Random(0)
-    pre = BlockPreprocessor((1, 1), [[True]], norm="B", calib_n=270, r_ref=500.)
-    tail = []
-    for i in range(2400):
-        value = (4070. if i < 600 else 2500.) + rng.uniform(-3, 3)
-        out = pre.update([[value]])[0, 0]
-        if np.isfinite(out) and i >= 2200:
-            tail.append(abs(out))
-    assert tail and sum(tail) / len(tail) < 0.08
+@pytest.mark.parametrize("filter_enabled", [False, True])
+@pytest.mark.parametrize("norm,expected", [("A", 300.), ("B", .5)])
+@pytest.mark.parametrize("direction,pressed", [("drop", 2200.), ("rise", 2800.)])
+def test_sustained_pressure_keeps_baseline_and_response(filter_enabled, norm, expected, direction, pressed):
+    pre = BlockPreprocessor((1, 1), [[True]], norm=norm, direction=direction,
+                            filter_enabled=filter_enabled)
+    feed(pre, [[2500.]], frames=300)
+    # Beyond the old slow tracker's settling time; every settled frame must hold.
+    feed(pre, [[pressed]], frames=30)
+    for _ in range(2700):
+        assert pre.update([[pressed]])[0, 0] == pytest.approx(expected)
+        assert pre.baselines[0, 0] == 2500.
+    assert feed(pre, [[2500.]], frames=35)[0, 0] == pytest.approx(0.)
 
 
 def test_delivery_scenario_empty_points_and_norm_a():
@@ -54,12 +56,15 @@ def test_delivery_scenario_empty_points_and_norm_a():
     assert out[0, 0] > 200.                          # 按压偏差 ~250 LSB
 
 
-def test_delivery_scenario_fps_time_scaling():
-    """场景4：fps 与 calib_n 换算（376.7 fps -> upd_n = 377）。"""
-    pre = BlockPreprocessor((1, 1), [[True]], norm="A", fps=376.7)
-    assert pre.upd_n == 377
-    fixed = BlockPreprocessor((1, 1), [[True]], fps=90.6)
-    assert fixed.upd_n == 91
+def test_new_zero_requires_explicit_reset():
+    pre = BlockPreprocessor((1, 1), [[True]], norm="A", filter_enabled=False, calib_n=3)
+    feed(pre, [[2500.]], frames=3)
+    assert feed(pre, [[2200.]], frames=1000)[0, 0] == 300.
+    pre.reset()
+    assert not pre.ready
+    assert np.isnan(feed(pre, [[2200.]], frames=2)[0, 0])
+    assert pre.update([[2200.]])[0, 0] == 0.
+    assert pre.baselines[0, 0] == 2200.
 
 
 # ---------------------------------------------------------------------- M3 行为
@@ -104,30 +109,27 @@ def test_point_filter_reset_clears_window():
     assert pre.update(1) is None
 
 
-# -------------------------------------------------------------------- slow 基线
+# -------------------------------------------------------------------- 固定基线
 
-def test_slow_needs_full_calibration_before_baseline():
-    tracker = BaselineTracker("slow", calib_n=270, upd_n=90, alpha=.2)
+def test_needs_full_calibration_before_baseline():
+    tracker = BaselineTracker(calib_n=270)
     for _ in range(269):
         assert tracker.update(2400) is None
     assert tracker.update(2400) == 2400
     assert tracker.count == 270 and tracker.ready
 
 
-def test_slow_ema_steps_only_after_full_block():
-    tracker = BaselineTracker("slow", calib_n=2, upd_n=4, alpha=.5)
+def test_fixed_baseline_survives_long_press_and_release():
+    tracker = BaselineTracker(calib_n=2)
     tracker.update(1000)
     tracker.update(1000)
     assert tracker.baseline == 1000
-    for _ in range(3):
-        tracker.update(800)
-    assert tracker.baseline == 1000                  # 残量不足一个块，不更新
-    tracker.update(800)                              # 第 4 个到齐: median=800
-    assert tracker.baseline == pytest.approx(900.)   # 1000 + .5*(800-1000)
+    for value in [800] * 3000 + [1000] * 3000:
+        assert tracker.update(value) == 1000
 
 
-def test_slow_median_resists_short_press():
-    tracker = BaselineTracker("slow", calib_n=1, upd_n=4, alpha=1.)
+def test_fixed_baseline_resists_short_press():
+    tracker = BaselineTracker(calib_n=1)
     tracker.update(1000)                             # 标定就绪
     tracker.update(500)                              # 短按一下
     for _ in range(3):
@@ -136,7 +138,7 @@ def test_slow_median_resists_short_press():
 
 
 def test_calib_mode_freezes_after_initial_median():
-    tracker = BaselineTracker("calib", calib_n=3, upd_n=2, alpha=.5)
+    tracker = BaselineTracker(calib_n=3)
     tracker.update(1000)
     tracker.update(2000)
     assert tracker.update(1500) == pytest.approx(1500.)
@@ -248,3 +250,77 @@ def test_invalid_arguments_raise():
         pre.set_norm("D")
     with pytest.raises(ValueError):
         pre.set_direction("down")
+
+
+def feed_tracker(tracker, values):
+    """依次喂入一窗标定样本，返回最后一次 update 的结果。"""
+    baseline = None
+    for value in values:
+        baseline = tracker.update(value)
+    return baseline
+
+
+def test_gate_accepts_stable_window():
+    tracker = BaselineTracker(calib_n=40)
+    assert feed_tracker(tracker, [2400 + (index % 5) - 2 for index in range(40)]) == pytest.approx(2400)
+    assert tracker.ready and not tracker.last_issue
+
+
+def test_gate_rejects_window_with_contact():
+    # 一半样本是按压态：波动远超阈值，不能固化成参考基线
+    tracker = BaselineTracker(calib_n=40)
+    assert feed_tracker(tracker, [2400] * 20 + [2000] * 20) is None
+    assert not tracker.ready and tracker.rejections == 1
+    assert "波动" in tracker.last_issue
+
+
+def test_gate_rejects_slow_drift():
+    # 波动只有 22 LSB（低于 30），但首尾中位数相差 22 LSB：说明在缓慢滑动
+    tracker = BaselineTracker(calib_n=40)
+    values = [2400] * 14 + [2410] * 13 + [2422] * 13
+    assert feed_tracker(tracker, values) is None
+    assert not tracker.ready and "漂移" in tracker.last_issue
+
+
+def test_gate_warns_when_baseline_jumps_after_recalibration():
+    tracker = BaselineTracker(calib_n=40)
+    assert feed_tracker(tracker, [2400] * 40) == pytest.approx(2400)
+    tracker.reset(keep_reference=True)          # 用户主动重标定：保留上一代基线
+    assert tracker.previous == pytest.approx(2400)
+    # 贴附变化会导致基线大幅跳变：只提醒不阻断，否则每次重新贴附都要点两次
+    assert feed_tracker(tracker, [2200] * 40) == pytest.approx(2200)
+    assert "偏离上一代" in tracker.last_warning
+    assert not tracker.last_issue
+
+
+def test_gate_blocks_after_repeated_rejections():
+    tracker = BaselineTracker(calib_n=40, gate=BaselineGate(max_attempts=2))
+    for _ in range(2):
+        feed_tracker(tracker, [2400] * 20 + [2000] * 20)
+    assert tracker.blocked and not tracker.ready
+    # 阻断后不再自动重试：即使之后数据正常也不再收集
+    assert feed_tracker(tracker, [2400] * 40) is None
+    assert tracker.count == 0
+
+
+def test_blocked_tracker_accepts_after_manual_reset():
+    tracker = BaselineTracker(calib_n=40, gate=BaselineGate(max_attempts=2))
+    for _ in range(2):
+        feed_tracker(tracker, [2400] * 20 + [2000] * 20)      # 窗口内像在接触 -> 连续被拒
+    assert tracker.blocked
+    tracker.reset(keep_reference=True)                        # 阻断后重置视为强制重来
+    assert tracker.previous is None and not tracker.blocked
+    assert feed_tracker(tracker, [2200] * 40) == pytest.approx(2200)
+
+
+def test_block_preprocessor_reports_gate_issue():
+    # 关掉 M3 可以跳过暖机，让标定窗口直接吃到原始阶跃
+    pre = BlockPreprocessor((1, 1), [[True]], norm="A", calib_n=40, filter_enabled=False)
+    for _ in range(20):
+        pre.update([[2400.]])
+    for _ in range(20):
+        pre.update([[2000.]])
+    assert not pre.ready
+    assert "行1列1" in pre.baseline_issue
+    assert not pre.baseline_blocked                # 只拒一次，还在自动重试
+    assert np.isnan(pre.recompose()[0, 0])         # 基线未固定，输出仍是缺失

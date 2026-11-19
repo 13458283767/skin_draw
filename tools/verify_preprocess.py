@@ -1,7 +1,7 @@
-"""Frame-by-frame equivalence check against the delivery pack algorithm.
+"""Frame-by-frame check against the delivery pack's fixed (calib) baseline mode.
 
 Runs three deterministic scenarios (random noise, step press/release, startup
-convergence with slow tracking) through both ``skin_draw.preprocessing`` and
+offset with a fixed baseline) through both ``skin_draw.preprocessing`` and
 the delivery pack ``上位机皮肤预处理算法交付包/skin_preprocess.py``. Every
 frame and point must agree (NaN == None) within 1e-9; the A-mode negative
 clamp is a documented renderer contract (plan section 2), so it is applied to
@@ -37,10 +37,9 @@ def scenario(name, shape, valid, *, norm, direction, calib_n, fps, r_ref, genera
     rows, cols = shape
     empty = {index + 1 for index, ok in enumerate(valid.ravel()) if not ok}
     ours = BlockPreprocessor(shape, valid, norm=norm, direction=direction,
-                             calib_n=calib_n, fps=fps, r_ref=r_ref)
-    pack = SkinPreprocessor(rows, cols, empty=empty, norm=norm, baseline_mode="slow",
+                             calib_n=calib_n, r_ref=r_ref)
+    pack = SkinPreprocessor(rows, cols, empty=empty, norm=norm, baseline_mode="calib",
                             direction=direction, calib_n=calib_n, fps=fps, r_ref=r_ref)
-    assert pack.base[0].upd_n == ours.upd_n, "slow-tracking block length must match"
     frames = generate()
     max_diff = 0.0
     mismatches = []

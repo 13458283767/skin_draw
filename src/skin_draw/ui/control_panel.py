@@ -115,7 +115,7 @@ class ControlPanel(QFrame):
         self.detected.setWordWrap(True)
         box.addWidget(self.detected)
         self.body_positions = QPushButton("恢复人体预设（14块）")
-        self.body_positions.setToolTip("按示意图①～⑭对应BLOCK 1～14恢复位置；未连接部位显示占位框。保留已有旋转、镜像及数据状态。")
+        self.body_positions.setToolTip("按预设部位恢复位置（9/10背部、腰部，13/14大腿）；未连接部位显示占位框。保留已有旋转、镜像及数据状态。")
         box.addWidget(self.body_positions)
         self.reset_positions = QPushButton("恢复自动排列")
         self.reset_positions.setEnabled(False)

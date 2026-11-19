@@ -35,7 +35,7 @@ window.controls.high.setValue(1000)
 window.source_badge.setText("人体预设 · 模拟数据")
 window.reception_bar.set_idle("模拟预览 · 未连接硬件")
 # Preview demonstrates existing rotation controls; preset itself never rotates.
-for key in (7, 8, 13, 14):
+for key in (7, 8, 9, 10):
     window.heatmap.set_orientation(key, BlockOrientation(90))
 window.controls.body_positions.click()
 window.show()
@@ -50,8 +50,8 @@ for size, name in (((1250, 860), "full.png"), ((1000, 720), "small.png")):
     window.heatmap.fit_view()
     app.processEvents()
     assert window.grab().save(str(output / name))
-partial = Frame(tuple(b for b in blocks if b.block_id in (1, 3, 7, 14)))
-window._display_frame(partial, {k: response[k] for k in (1, 3, 7, 14)})
+partial = Frame(tuple(b for b in blocks if b.block_id in (1, 3, 7, 10)))
+window._display_frame(partial, {k: response[k] for k in (1, 3, 7, 10)})
 window.source_badge.setText("4块连接示意 · 模拟数据")
 QTest.qWait(160)
 assert window.grab().save(str(output / "partial.png"))

@@ -1,5 +1,8 @@
 {
   "threshold_counts": 100,
+  "onset_counts": 20.0,
+  "edge_counts": 50.0,
+  "edge_pad_s": 0.0,
   "hug_min_regions": 3,
   "max_block_switches": 0,
   "multi_region_actions": ["hug"]

@@ -6,6 +6,8 @@ from dataclasses import replace
 from datetime import datetime
 from math import ceil
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import numpy as np
 from time import perf_counter
@@ -20,14 +22,17 @@ from ..models import Frame
 from ..mapping import BlockOrientation
 from ..sensor_masks import SensorMasks, default_mask_path
 from ..collection_activation import load_activation_policy
+from ..collection_baseline import load_trial_baseline_policy
 from ..collection_layout import CollectionLayoutStore
 from ..collection_quality import LEVELS, QUALITY_NAMES, load_quality_policy
+from ..collection_waveform import LiveWaveform, load_waveform
 from ..dataset import (MAX_ADC_COLUMNS, CalibrationSnapshot, DatasetStore, RawSampleRecorder,
                        RecordingPlan, default_labels, layout_adc_columns)
 from ..transport import available_ports
 from ..simulator import demo_specs, generate_frame
 from .control_panel import ControlPanel, label
 from .collection_bar import CollectionBar
+from .collection_waveform import CollectionWaveform
 from .heatmap_view import HeatmapView, SensorReading
 from .serial_worker import SerialWorker
 from .reception_rate_bar import ReceptionRateBar
@@ -93,6 +98,12 @@ class MainWindow(QMainWindow):
         self.recorder = RawSampleRecorder()
         self.recording_plan: RecordingPlan | None = None
         self.last_sample = None
+        self._collection_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="skin-collection-review")
+        self._collection_job = None
+        self._preview = None
+        self._review_pending = False
+        self._replay_cancel = Event()
+        self._close_after_collection = False
         self.setWindowTitle("SkinDraw · 原始 ADC 测试" if raw_adc else "SkinDraw · 电子皮肤热力图")
         self.resize(1250, 860)
         self.setMinimumSize(1000, 720)
@@ -173,6 +184,11 @@ class MainWindow(QMainWindow):
         self.hover_label.setFixedHeight(22)
         card_box.addWidget(self.hover_label)
         right.addWidget(card, 1)
+        self.waveform = CollectionWaveform()
+        right.addWidget(self.waveform)
+        self.waveform.confirmed.connect(self._confirm_boundaries)
+        self.waveform.deferred.connect(self._defer_boundaries)
+        self.waveform.live_enabled.toggled.connect(self._set_live_preview_enabled)
         stats = QHBoxLayout()
         stats.setSpacing(12)
         self.min_title, self.min_label = self._stat(stats, "最小值 / ADC")
@@ -207,6 +223,12 @@ class MainWindow(QMainWindow):
         self.recording_timer = QTimer(self)
         self.recording_timer.setInterval(100)
         self.recording_timer.timeout.connect(self._refresh_recording)
+        self.waveform_timer = QTimer(self)
+        self.waveform_timer.setInterval(100)
+        self.waveform_timer.timeout.connect(self._refresh_waveform)
+        self.collection_job_timer = QTimer(self)
+        self.collection_job_timer.setInterval(40)
+        self.collection_job_timer.timeout.connect(self._poll_collection_job)
         self._connect_controls()
         self._init_recording_identity()
         self.heatmap.set_show_values(self.controls.show_values.isChecked())
@@ -275,7 +297,7 @@ class MainWindow(QMainWindow):
         self.heatmap.layout_changed.connect(self._layout_changed)
         bar = self.collection_bar
         bar.start.clicked.connect(self._start_recording)
-        bar.stop.clicked.connect(lambda: self.finish_recording("user_stop"))
+        bar.stop.clicked.connect(lambda: self.finish_recording("user_stop", background=True))
         bar.mark_valid.clicked.connect(lambda: self._mark_sample(True))
         bar.mark_void.clicked.connect(lambda: self._mark_sample(False))
         bar.dataset_button.clicked.connect(self._open_dataset)
@@ -444,7 +466,7 @@ class MainWindow(QMainWindow):
 
     def _identity_changed(self, *_):
         bar = self.collection_bar
-        active = self._recording_active()
+        active = self._recording_active() or self._review_pending
         try:
             subject = bar.subject.currentText().strip()
             subjects = self.dataset_store.list_subjects()
@@ -486,7 +508,7 @@ class MainWindow(QMainWindow):
 
     def delete_selected_identity(self, is_session=False):
         """删除当前选项并自动收缩列表，已保存的其他编号和标签保持不变。"""
-        if self._recording_active():
+        if self._recording_active() or self._review_pending:
             raise ValueError("正在采集，不能删除受试者或场次")
         bar = self.collection_bar
         subject = bar.subject.currentText().strip()
@@ -541,7 +563,7 @@ class MainWindow(QMainWindow):
         return action
 
     def _recording_active(self):
-        return self.recorder.active
+        return self.recorder.active or self._collection_job is not None
 
     def _refresh_trial_preview(self, *_):
         if self._recording_active():
@@ -559,7 +581,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_recording_availability(self):
         bar = self.collection_bar
-        if self._recording_active():
+        if self._recording_active() or self._review_pending:
             bar.start.setEnabled(False)
             return
         ready = (self.worker is not None and self.input_source == "hardware"
@@ -612,6 +634,8 @@ class MainWindow(QMainWindow):
         """Begin one action sample; identity is locked until ``finish_recording``."""
         if self._recording_active():
             raise ValueError("上一段样本尚未结束")
+        if self._review_pending:
+            raise ValueError("请先确认上一条接触起止，或点击暂不标注")
         if self.labels_error:
             raise ValueError(f"动作类别表不可用：{self.labels_error}")
         if self.worker is None or self.input_source != "hardware":
@@ -627,6 +651,7 @@ class MainWindow(QMainWindow):
         self._check_recording_shapes(layout)
         quality_policy = load_quality_policy(self.mask_path.parent / "collection_quality.json")
         activation_policy = load_activation_policy(self.mask_path.parent / "collection_activation.json")
+        baseline_policy = load_trial_baseline_policy(self.mask_path.parent / "collection_baseline.json")
         cadence = self.worker.buffer.recording_cadence(tuple(layout.by_id), quality_policy)
         columns = layout_adc_columns(layout)
         if not 1 <= columns <= MAX_ADC_COLUMNS:
@@ -648,17 +673,23 @@ class MainWindow(QMainWindow):
             layout=layout, labels_id=self.dataset_labels.labels_id,
             expected_block_ids=tuple(layout.by_id), max_adc_columns=columns,
             calibration=calibration, quality_policy=quality_policy,
-            activation_policy=activation_policy, cadence_references=cadence)
+            activation_policy=activation_policy, cadence_references=cadence,
+            trial_baseline_policy=baseline_policy)
         self.recorder.start(plan)
         self.recording_plan = plan
         self.last_sample = None
+        self._preview = LiveWaveform(plan)
+        self.recorder.preview_queue = self._preview.queue if self.waveform.live_enabled.isChecked() else None
+        self.waveform.begin(plan.expected_block_ids, baseline_seconds=baseline_policy.duration_s)
+        self.waveform_timer.setInterval(100)
+        self.waveform_timer.start()
         self.recording_timer.start()
         bar.set_recording(True)
         bar.set_trial(trial_id, "本条样本编号（编号冻结，结束后自动指向下一条）")
-        bar.set_sample_state("录制中", "warn")
+        bar.set_sample_state("采集基线", "warn")
         bar.set_stats(0., 0, {})
         bar.set_integrity(self.recorder.snapshot().integrity)
-        bar.set_status(f"录制中 · {subject} / {session} / {trial_id}；结束后先完成写盘再开始下一条", "warn")
+        bar.set_status(f"请勿接触 · 正在采集前 {baseline_policy.duration_s:g} 秒基线，等待可以开始动作的提示", "warn")
         self._layout_changed()  # reapplies the editing locks for the recording state
         event(logger, logging.INFO, "开始采集训练样本", subject_id=subject, session_id=session,
               trial_id=trial_id, action_id=action.id, layout_id=layout.layout_id,
@@ -676,14 +707,8 @@ class MainWindow(QMainWindow):
                 "receive_mode": controls.receive_mode.currentData(),
                 "protocol": controls.protocol.currentData()}
 
-    def finish_recording(self, reason="user_stop", *, notify=True):
-        """Close the sample boundary, drain the writer, then refresh index.csv."""
-        if not self._recording_active():
-            return None
-        self.recording_timer.stop()
+    def _finalize_collection_files(self, reason):
         result = self.recorder.stop(reason)
-        self.last_sample = result
-        self.collection_bar.set_recording(False)
         index_error = ""
         if result is not None and not result.meta_error:
             try:
@@ -691,7 +716,46 @@ class MainWindow(QMainWindow):
             except OSError as error:
                 index_error = str(error)
                 logger.exception("样本清单刷新失败")
+        return result, index_error
+
+    def finish_recording(self, reason="user_stop", *, notify=True, background=False):
+        """UI calls use background=True; synchronous entry retained for scripts/tests."""
+        if not self.recorder.active or self._collection_job is not None:
+            return None
+        self.recording_timer.stop()
+        self.waveform_timer.stop()
+        self.recorder.seal()  # Close at the button time, not at worker scheduling time.
+        self.recorder.preview_queue = None
+        if self._preview is not None:
+            self._preview.close()
+        if background:
+            self.collection_bar.stop.setEnabled(False)
+            self.collection_bar.start.setEnabled(False)
+            self.collection_bar.set_status("正在后台完成原始文件写入…", "warn")
+            self.waveform.set_mode("finalizing", "正在完成写盘；热力图继续更新")
+            self._collection_job = ("finalize", self._collection_executor.submit(
+                self._finalize_collection_files, reason), (reason, notify))
+            self.collection_job_timer.start()
+            return None
+        result, index_error = self._finalize_collection_files(reason)
+        self._collection_finalized(result, index_error, reason, notify)
+        return result
+
+    def _collection_finalized(self, result, index_error, reason, notify):
+        self.last_sample = result
+        self.collection_bar.set_recording(False)
         self._show_sample_result(result, index_error)
+        if (self._preview is not None and result is not None and not result.meta_error
+                and not self._close_after_collection and self.recorder._writer is None):
+            self._review_pending = True
+            self._replay_cancel = Event()
+            self.waveform.set_mode("loading", "原始文件已写完，正在后台读取完整波形…")
+            self._collection_job = ("replay", self._collection_executor.submit(
+                load_waveform, self.recording_plan, result.duration_s, self._replay_cancel), result.meta_path)
+            self.collection_job_timer.start()
+            self.collection_bar.set_recording(True)
+            self.collection_bar.stop.setEnabled(False)
+        self._preview = None
         # 手动输入的新编号在首次录制后也需要加入下拉列表，重启可直接选择。
         self._refresh_identity_choices(self.collection_bar.subject.currentText(),
                                        self.collection_bar.session.currentText())
@@ -702,11 +766,88 @@ class MainWindow(QMainWindow):
               written=getattr(result, "written_records", None),
               missing=list(getattr(result, "missing_block_ids", ())),
               sample=str(result.sample_dir) if result is not None else None)
-        if notify and result is not None and result.status != "complete":
+        if notify and result is not None and result.status != "complete" and not self._close_after_collection:
             QMessageBox.warning(self, "样本未完整保存",
                                 "样本已保留但标记为未完成，不会自动进入正常训练集合。\n"
                                 f"原因：{result.end_reason}\n目录：{result.sample_dir}")
-        return result
+
+    def _refresh_waveform(self):
+        # Heatmap commits retain their existing scheduling. Never drain a display
+        # backlog or take the receive lock from this low-priority timer.
+        if (self._preview is None or not self.waveform.isVisible()
+                or not self.waveform.live_enabled.isChecked() or self.display_timer.isActive()):
+            return
+        self.waveform.draw(self._preview.snapshot)
+        self.waveform_timer.setInterval(min(1000, max(100, int(self.waveform.last_draw_ms * 50))))
+
+    def _set_live_preview_enabled(self, enabled):
+        if self._preview is not None and self.recorder.active and self._collection_job is None:
+            self.recorder.preview_queue = self._preview.queue if enabled else None
+
+    def _poll_collection_job(self):
+        job = self._collection_job
+        if job is None:
+            self.collection_job_timer.stop()
+            return
+        kind, future, context = job
+        if not future.done():
+            return
+        self._collection_job = None
+        try:
+            value = future.result()
+            if kind == "finalize":
+                self._collection_finalized(*value, *context)
+            elif kind == "replay":
+                if value is not None and self.last_sample is not None and self.last_sample.meta_path == context:
+                    self.waveform.draw(value, full=True)
+                    self.waveform.set_baseline_review(self.last_sample.baseline,
+                                                      self.last_sample.activation)
+            elif kind == "annotation":
+                self._clear_waveform_review()
+                self.collection_bar.set_status("接触起止已保存到 meta.json，波形已清空", "ok")
+        except Exception as error:
+            logger.exception("采集后台任务失败：%s", kind)
+            self.collection_bar.set_status(f"{kind} 失败，原始数据保留：{error}", "error")
+            if kind == "annotation":
+                self.waveform.set_mode("review", f"标注未保存，请重试：{error}")
+            elif kind == "replay":
+                self.waveform.set_mode("review", f"完整波形读取失败，可暂不标注：{error}")
+        self._refresh_recording_availability()
+        if self._collection_job is None:
+            self.collection_job_timer.stop()
+            if self._close_after_collection:
+                QTimer.singleShot(0, self.close)
+
+    def _confirm_boundaries(self, start_s, end_s):
+        if self._collection_job is not None or not self._review_pending or self.last_sample is None:
+            return
+        self.waveform.set_mode("saving", "正在保存接触起止…")
+        self.collection_bar.mark_valid.setEnabled(False)
+        self.collection_bar.mark_void.setEnabled(False)
+        self._collection_job = ("annotation", self._collection_executor.submit(
+            self.dataset_store.update_annotation, self.last_sample.meta_path, start_s, end_s), None)
+        self.collection_job_timer.start()
+
+    def _clear_waveform_review(self):
+        self._review_pending = False
+        self.waveform.clear()
+        self.collection_bar.set_recording(False)
+        if self.last_sample is not None:
+            self._show_sample_result(self.last_sample)
+        self._identity_changed()
+        self._layout_changed()
+        self._refresh_recording_availability()
+
+    def _defer_boundaries(self):
+        if self._collection_job is not None:
+            return
+        activation = (self.last_sample.activation if self.last_sample else None) or {}
+        auto = activation.get("contact_start_s") is not None
+        self._clear_waveform_review()
+        # 自动起的样本点"暂不标注"即保留自动值，不把人工作为必经步骤。
+        self.collection_bar.set_status(
+            "原始文件已保存，接触起止保留为自动检测结果" if auto
+            else "原始文件已保存，接触起止保持未标注", "ok" if auto else "warn")
 
     def _show_sample_result(self, result, index_error=""):
         bar = self.collection_bar
@@ -727,8 +868,15 @@ class MainWindow(QMainWindow):
             detail = "；".join(reasons[:2])
             activation = result.activation or {}
             region = f" · 区域 {activation.get('region_set') or '-'}（{activation.get('region_count', 0)} 块）"
+            start, end = activation.get("contact_start_s"), activation.get("contact_end_s")
+            if start is None or end is None:
+                tail = " · 待人工确认动作"
+            else:
+                tail = f" · 已自动标注 {start:.2f}–{end:.2f} 秒"
+                if activation.get("open_at_end"):
+                    tail += "（结束时仍在接触）"
             bar.set_status(f"已保存 {trial} · {result.duration_s:.1f} 秒 · {QUALITY_NAMES[quality]}"
-                           + region + (f" · {detail}" if detail else " · 待人工确认动作"),
+                           + region + (f" · {detail}" if detail else tail),
                            "error" if quality == "fail" else ("warn" if quality == "warn" else "ok"))
             bar.set_sample_state("不合格" if quality == "fail" else "未判定", "error" if quality == "fail" else "warn",
                                  can_accept=quality != "fail", can_void=True)
@@ -742,6 +890,7 @@ class MainWindow(QMainWindow):
                 reasons.append(f"只写入 {result.written_records}/{result.records} 行")
             if result.errors:
                 reasons.append(f"{len(result.errors)} 项数据异常")
+            reasons.extend(result.baseline.get("reasons", []))
             bar.set_status(f"未完成 {trial}（{result.end_reason}）：" + "；".join(reasons or ["请检查日志"]), "error")
             bar.set_sample_state("未完成", "error", can_void=result.meta_path is not None)
         bar.status.setToolTip(str(result.sample_dir) + "\n" + "\n".join(result.integrity.get("reasons", [])))
@@ -757,7 +906,19 @@ class MainWindow(QMainWindow):
         self.collection_bar.set_integrity(stats.integrity)
         # 单块时间空缺继续保留其他块；磁盘已失败时及时结束本段。
         if stats.fatal_error:
-            self.finish_recording("write_error", notify=False)
+            self.finish_recording("write_error", notify=False, background=True)
+            return
+        baseline = stats.baseline
+        phase = baseline.get("status")
+        if phase == "failed":
+            self.finish_recording("baseline_failed", notify=False, background=True)
+            return
+        if phase in ("collecting", "processing"):
+            remaining = max(0., baseline["window_end_s"] - stats.duration_s)
+            message = (f"请勿接触 · 基线采集中，剩余 {remaining:.1f} 秒" if phase == "collecting"
+                       else "请勿接触 · 正在检查基线，等待开始动作提示")
+            self.collection_bar.set_status(message, "warn")
+            self.waveform.message.setText(message)
             return
         plan = self.recording_plan
         detail = (f"录制中 · {plan.subject_id} / {plan.session_id} / {plan.trial_id}"
@@ -771,7 +932,11 @@ class MainWindow(QMainWindow):
         quality = stats.integrity.get("status", "pass")
         if stats.integrity.get("reasons"):
             detail += " · " + stats.integrity["reasons"][0]
-        self.collection_bar.set_status(detail, "error" if quality == "fail" else "warn")
+        if phase == "ready":
+            detail = "可以开始动作 · 本条基线已固定 · " + detail
+            self.collection_bar.set_sample_state("动作采集", "ok")
+            self.waveform.message.setText("可以开始动作 · 本条基线已固定；停止后人工确认接触起止")
+        self.collection_bar.set_status(detail, "error" if quality == "fail" else ("ok" if phase == "ready" else "warn"))
 
     def _start_recording(self):
         try:
@@ -795,6 +960,7 @@ class MainWindow(QMainWindow):
             archive = self.dataset_store.archive_sample(result.meta_path)
             # 已移动的样本不再作为“本次”操作目标，防止重复作废或标记有效。
             self.last_sample = None
+            self._clear_waveform_review()
             self.collection_bar.set_sample_state("已作废", "idle")
             self.collection_bar.set_status("已作废：本次样本已移出正式数据集，可通过“恢复删除”找回", "ok")
             self.collection_bar.setToolTip(f"本次样本回收位置：{archive}")
@@ -1260,7 +1426,7 @@ class MainWindow(QMainWindow):
             # A disconnect ends the open sample first: the CSV boundary must not
             # outlive the data source, and the writer has to drain before restart.
             if self._recording_active():
-                self.finish_recording("disconnect", notify=False)
+                self.finish_recording("disconnect", notify=False, background=True)
             self.collection_bar.start.setEnabled(False)
             self.pending_live_info = None
             self.accept_scans = False
@@ -1415,6 +1581,8 @@ class MainWindow(QMainWindow):
                      snapshot.preprocess.norm, snapshot.preprocess.direction,
                      snapshot.preprocess.filter_enabled,
                      tuple(sorted(snapshot.preprocess.samples.items())),
+                     snapshot.preprocess.baseline_issue,
+                     snapshot.preprocess.baseline_warning,
                      bool(scan.protocol_errors))
         refresh_info = snapshot is None or state != self.live_info_state
         self.live_info_state = state
@@ -1447,13 +1615,18 @@ class MainWindow(QMainWindow):
                 self.controls.calibration_details.setToolTip("")
             else:
                 self.controls.calibration_progress.setToolTip(
-                    f"标定样本最少 {min(state.samples.values())}/{state.target}（慢跟踪基线）")
-                self.controls.calibration_details.setText(" · ".join(
-                    f"BLOCK {key:02d} {count}/{state.target}" for key, count in pending.items()))
-                self.controls.calibration_details.setToolTip("标定完成后基线仍会约每秒用中位数微调（慢跟踪）")
+                    f"标定样本最少 {min(state.samples.values())}/{state.target}（标定后固定基线）")
+                # 闸门拒绝时直接显示原因，避免操作员把“标定未通过”误读成“还在等数据”。
+                self.controls.calibration_details.setText(
+                    state.baseline_issue if state.baseline_issue else " · ".join(
+                        f"BLOCK {key:02d} {count}/{state.target}" for key, count in pending.items()))
+                self.controls.calibration_details.setToolTip("标定完成后基线固定；需重新校准时，松开所有皮肤块并点击“重置滤波与基线”")
                 self.controls.calibration_details.setVisible(True)
             self.controls.recalibrate.setEnabled(True)
-            self.source_badge.setText("实时按压热力图" if state.ready else f"自动标定 {state.progress}%")
+            if state.baseline_issue:
+                self.source_badge.setText("标定未通过 · 见左侧提示")
+            else:
+                self.source_badge.setText("实时按压热力图" if state.ready else f"自动标定 {state.progress}%")
         missing = sorted(set(scan.expected_ids) - {b.block_id for b in scan.frame.blocks})
         if not scan.frame.blocks:
             self.source_badge.setText("等待数据 · 画面非实时")
@@ -1475,7 +1648,7 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _serial_failed(self, message):
         if self._recording_active():
-            self.finish_recording("disconnect", notify=False)
+            self.finish_recording("disconnect", notify=False, background=True)
         self.accept_scans = False
         self.display_timer.stop()
         self.reception_timer.stop()
@@ -1491,7 +1664,7 @@ class MainWindow(QMainWindow):
         # The worker is gone: close the sample so the writer drains and meta.json
         # records why the recording ended instead of leaving it "recording".
         if self._recording_active():
-            self.finish_recording("disconnect", notify=False)
+            self.finish_recording("disconnect", notify=False, background=True)
         self.reception_timer.stop()
         self.reception_bar.set_idle("采集已停止")
         self._flush_live()
@@ -1649,9 +1822,18 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         logger.info("关闭窗口 requested worker_active=%s", self.worker is not None)
-        if self._recording_active():
-            # Close the boundary and drain the CSV before the process can exit.
-            self.finish_recording("app_exit", notify=False)
+        if self.recorder.active or self._collection_job is not None:
+            self._close_after_collection = True
+            self._replay_cancel.set()
+            if self.recorder.active and self._collection_job is None:
+                self.finish_recording("app_exit", notify=False, background=True)
+            event.ignore()
+            return
+        self.waveform_timer.stop()
+        self.collection_job_timer.stop()
+        if self._preview is not None:
+            self._preview.close()
+        self._collection_executor.shutdown(wait=False)
         self.timer.stop()
         self.display_timer.stop()
         self.health_timer.stop()

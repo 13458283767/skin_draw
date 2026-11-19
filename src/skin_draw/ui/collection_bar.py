@@ -62,7 +62,7 @@ class CollectionBar(QFrame):
         row.addStretch(1)
         self.start = QPushButton("开始采集")
         self.start.setObjectName("primary")
-        self.start.setToolTip("录制原始 ADC 到数据集；开始前需连接硬件并固定采集布局。")
+        self.start.setToolTip("先保持约1秒无接触，基线检查通过后按提示开始动作；需完成连接标定并固定采集布局。")
         self.stop = QPushButton("结束采集")
         self.stop.setEnabled(False)
         self.stop.setToolTip("关闭本次样本的录制边界，不必断开串口；结束后先完成写盘。")

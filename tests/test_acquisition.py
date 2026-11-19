@@ -69,10 +69,6 @@ def test_devices_discovery_to_auto_baseline_to_press(ids):
     stop, clock = Event(), FakeClock()
     port = FakePort(clock, ids, quiet_requests=1 + QUIET_ROUNDS)
     live = LiveBuffer(calib_n=30, norm="A")
-    # Deterministic cadence: the real cadence would derive upd_n from the
-    # measured rate; here the press window must stay below one slow-baseline
-    # update so the frozen 2300 baseline yields exactly 500 on display.
-    live._measured_fps = lambda key: 100.0
     scans = []
 
     def on_scan(scan):

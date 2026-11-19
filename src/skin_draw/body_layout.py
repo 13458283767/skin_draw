@@ -11,6 +11,12 @@ from .models import Frame
 
 BODY_PRESET = tuple(json.loads(files("skin_draw").joinpath("presets/body_layout.json").read_text(encoding="utf-8"))["blocks"])
 BODY_NAMES = {entry["id"]: entry["name"] for entry in BODY_PRESET}
+# Slots are driven by the preset's anatomy flags, so renumbering a part in the
+# preset never has to be repeated here. Legs sit under the abdomen; rear blocks
+# (back and waist) own the separate back-view column.
+LEG_IDS = tuple(entry["id"] for entry in BODY_PRESET if "leg" in entry)
+REAR_IDS = tuple(entry["id"] for entry in BODY_PRESET if entry.get("region") == "rear")
+LAST_PRESET_ID = max(BODY_NAMES)
 
 
 @dataclass(frozen=True)
@@ -54,7 +60,7 @@ def arrange_body(frame: Frame, width: float, height: float,
         widths = {key: max(spec.display_shape[1], 56 / cell) for key, spec in specs.items()}
         left_width = max(widths[key] for key in (3, 5, 11))
         right_width = max(widths[key] for key in (4, 6, 12))
-        leg_width = max(widths[9], widths[10])
+        leg_width = max(widths[key] for key in LEG_IDS)
         shoulder_width = max(widths[1], widths[2])
         center_width = max(widths[7], widths[8], 2 * leg_width + gap,
                            2 * shoulder_width + gap)
@@ -62,7 +68,7 @@ def arrange_body(frame: Frame, width: float, height: float,
         left_x = margin + left_width / 2
         right_x = cx + center_width / 2 + gap + right_width / 2
         front_right = right_x + right_width / 2
-        back_width = max(widths[key] for key in specs if key >= 13)
+        back_width = max(widths[key] for key in REAR_IDS)
         separation = max(2.5, 28 / cell)
         back_x = front_right + separation + back_width / 2
         chest_y = header + max(heights[1], heights[2]) + vertical_gap
@@ -71,19 +77,19 @@ def arrange_body(frame: Frame, width: float, height: float,
             2: (cx + center_width / 2 - shoulder_width / 2, chest_y - vertical_gap - heights[2]),
             7: (cx, chest_y),
             8: (cx, chest_y + heights[7] + vertical_gap),
-            13: (back_x, chest_y),
+            REAR_IDS[0]: (back_x, chest_y),
         }
         for upper, lower, hand, x in ((3, 5, 11, left_x), (4, 6, 12, right_x)):
             positions[upper] = (x, chest_y)
             positions[lower] = (x, chest_y + heights[upper] + vertical_gap)
             positions[hand] = (x, positions[lower][1] + heights[lower] + vertical_gap)
         legs_y = positions[8][1] + heights[8] + vertical_gap
-        positions[9] = (cx - (leg_width + gap) / 2, legs_y)
-        positions[10] = (cx + (leg_width + gap) / 2, legs_y)
-        positions[14] = (back_x, max(positions[8][1], chest_y + heights[13] + vertical_gap))
-        cursor = positions[14][1] + heights[14] + vertical_gap
+        positions[LEG_IDS[0]] = (cx - (leg_width + gap) / 2, legs_y)
+        positions[LEG_IDS[1]] = (cx + (leg_width + gap) / 2, legs_y)
+        positions[REAR_IDS[1]] = (back_x, max(positions[8][1], chest_y + heights[REAR_IDS[0]] + vertical_gap))
+        cursor = positions[REAR_IDS[1]][1] + heights[REAR_IDS[1]] + vertical_gap
         for key in sorted(specs):
-            if key > 14:
+            if key > LAST_PRESET_ID:
                 positions[key] = (back_x, cursor)
                 cursor += heights[key] + vertical_gap
         slots = tuple(replace(spec, x=positions[key][0] - spec.display_shape[1] / 2,

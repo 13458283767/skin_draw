@@ -20,22 +20,22 @@ def body_frame(ids=range(1, 15), shape=None):
 def test_anatomical_relations_and_absent_slots_do_not_shift_present_blocks():
     frame = body_frame()
     full = arrange_body(frame, 600, 450)
-    partial = arrange_body(body_frame((1, 4, 7, 14)), 600, 450)
+    partial = arrange_body(body_frame((1, 4, 7, 10)), 600, 450)
     specs = {s.block_id: s for s in full.blocks}
-    assert partial.blocks == tuple(s for s in full.blocks if s.block_id in (1, 4, 7, 14))
+    assert partial.blocks == tuple(s for s in full.blocks if s.block_id in (1, 4, 7, 10))
     assert len(partial.slots) == 14
     assert full.bounds == partial.bounds
     assert validate_layout(full.slots) == full.slots
-    for right, left in ((1, 2), (3, 4), (5, 6), (9, 10), (11, 12)):
+    for right, left in ((1, 2), (3, 4), (5, 6), (11, 12), (13, 14)):
         assert specs[right].x < specs[left].x  # subject right = screen left
     assert specs[1].y < specs[3].y < specs[5].y < specs[11].y
-    assert specs[7].y < specs[8].y < specs[9].y
-    assert specs[3].x < specs[7].x < specs[4].x < specs[13].x
-    assert specs[13].y < specs[14].y
+    assert specs[7].y < specs[8].y < specs[13].y
+    assert specs[3].x < specs[7].x < specs[4].x < specs[9].x
+    assert specs[9].y < specs[10].y
 
 
 def test_compact_body_uses_current_sizes_and_places_hands_beside_thighs():
-    orientations = {key: BlockOrientation(90) for key in (7, 8, 13, 14)}
+    orientations = {key: BlockOrientation(90) for key in (7, 8, 9, 10)}
     plan = arrange_body(body_frame(), 800, 520, orientations)
     specs = {s.block_id: s for s in plan.blocks}
     validate_layout(plan.slots)
@@ -43,11 +43,11 @@ def test_compact_body_uses_current_sizes_and_places_hands_beside_thighs():
     # this viewport the compact body should give each sensor at least 12 px.
     assert plan.cell_pixels >= 12
     assert plan.bounds[3] < 43
-    assert specs[11].y < specs[9].y + specs[9].display_shape[0]
-    assert specs[12].y < specs[10].y + specs[10].display_shape[0]
-    assert specs[10].x - (specs[9].x + specs[9].display_shape[1]) < 2
+    assert specs[11].y < specs[13].y + specs[13].display_shape[0]
+    assert specs[12].y < specs[14].y + specs[14].display_shape[0]
+    assert specs[14].x - (specs[13].x + specs[13].display_shape[1]) < 2
     assert specs[4].x - (specs[7].x + specs[7].display_shape[1]) < 4
-    assert specs[13].x - (specs[4].x + specs[4].display_shape[1]) < 5
+    assert specs[9].x - (specs[4].x + specs[4].display_shape[1]) < 5
 
 
 @pytest.mark.parametrize("shape", [(16, 16), (1, 16), (16, 1)])
@@ -114,7 +114,7 @@ def test_restore_preserves_arrays_orientation_selection_and_live_item_cache(wind
 
 def test_missing_and_reconnecting_preserve_mode_and_raw_sensor_values(window):
     view = window.heatmap
-    frame = body_frame((1, 7, 13))
+    frame = body_frame((1, 7, 9))
     view.set_frame(frame, layout_blocks=frame.blocks)
     window.controls.body_positions.click()
     pos = view.items[7].pos()

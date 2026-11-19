@@ -1,4 +1,4 @@
-"""slow 标定语义：M3 暖机 + 中位数标定按样本计数，分块独立、与时间无关。"""
+"""固定基线：M3 暖机 + 中位数标定按样本计数，分块独立、与时间无关。"""
 
 import numpy as np
 import pytest
@@ -19,6 +19,33 @@ class Clock:
 def setup():
     clock = Clock()
     return clock, LiveBuffer(clock=clock, calib_n=30, norm="A")
+
+
+@pytest.mark.parametrize("filter_enabled", [False, True])
+def test_live_long_hold_preserves_raw_and_fixed_snapshot(filter_enabled):
+    from skin_draw.dataset import CalibrationSnapshot
+
+    buffer = LiveBuffer(calib_n=30, norm="A", filter_enabled=filter_enabled)
+    for _ in range(60):
+        buffer.receive(Block(1, [[2500]]))
+    baselines, count = buffer.baseline_snapshot()
+    saved = CalibrationSnapshot.from_baselines("calib_001", "test", baselines, calib_samples=count).to_dict()
+    assert saved["baseline_mode"] == "calib"
+    assert saved["method"] == "runtime_fixed_baseline_snapshot"
+    raw_values = []
+    buffer.set_raw_sink(lambda block, now: raw_values.append(int(block.values[0, 0])))
+    for _ in range(2700):
+        buffer.receive(Block(1, [[2200]]))
+    snap = buffer.take()
+    assert snap.display_values[1][0, 0] == 300.
+    assert snap.preprocess.baselines[1][0, 0] == 2500.
+    assert snap.preprocess.message == "自动标定完成 · 基线已固定"
+    assert raw_values == [2200] * 2700
+    buffer.reset_preprocessing()
+    for _ in range(60):
+        buffer.receive(Block(1, [[2400]]))
+    assert buffer.baseline_snapshot()[0][1][0, 0] == 2400.
+    assert saved["baselines"]["1"] == [[2500.]]
 
 
 @pytest.mark.parametrize("hz", [20, 45, 90, 180])

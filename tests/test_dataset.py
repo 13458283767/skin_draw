@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 from threading import Lock
 from types import SimpleNamespace
+from time import perf_counter, sleep
 
 import numpy as np
 import pytest
@@ -19,6 +20,14 @@ from skin_draw.ui.main_window import MainWindow
 WALL = datetime(2026, 10, 20, 15, 30, 0).astimezone()
 
 
+def wait_collection(app, window):
+    deadline = perf_counter() + 5
+    while window._collection_job is not None and perf_counter() < deadline:
+        app.processEvents()
+        sleep(.005)
+    assert window._collection_job is None
+
+
 class FakeClock:
     """Deterministic monotonic clock so relative CSV times are exact in tests."""
 
@@ -32,6 +41,21 @@ class FakeClock:
 def make_layout(*specs):
     blocks = tuple(CollectionBlock(spec, np.ones((spec.rows, spec.cols), bool)) for spec in specs)
     return CollectionLayout("skin_layout_v1", blocks, "grid", ())
+
+
+def complete_ui_baseline(window, buffer, raw, keys):
+    clock = window.recorder.clock
+    for i in range(100):
+        clock.value = i / 100
+        for key in keys:
+            buffer.receive(Block(key, raw))
+    clock.value = 1.
+    window._refresh_recording()
+    window.recorder._trial_baseline.thread.join(2)
+    window._refresh_recording()
+    assert window.recorder.snapshot().baseline["status"] == "ready"
+    assert "可以开始动作" in window.collection_bar.status.text()
+    clock.value = 1.01
 
 
 def make_plan(root, layout, *, trial="pat001", expected=None, calibration=None):
@@ -182,12 +206,15 @@ def test_recording_end_to_end_with_ui_and_index(app, tmp_path):
     try:
         window.present_frame(Frame((Block(7, raw),)))
         window.save_collection_layout()
-        buffer = LiveBuffer()
+        clock = FakeClock()
+        window.recorder.clock = clock
+        buffer = LiveBuffer(clock=clock, filter_enabled=False, calib_n=3)
         window.worker = SimpleNamespace(buffer=buffer)
         window.attach_recording_sink(buffer)
         window.input_source = "hardware"
         window._refresh_recording_availability()
-        buffer.receive(Block(7, raw))  # first frame is needed before a sample may start
+        for _ in range(3):
+            buffer.receive(Block(7, raw))
         assert window.collection_bar.start.isEnabled()
 
         window.collection_bar.subject.setCurrentText("student01")
@@ -203,11 +230,18 @@ def test_recording_end_to_end_with_ui_and_index(app, tmp_path):
         with pytest.raises(ValueError, match="正在采集"):
             window.save_collection_layout()
 
+        complete_ui_baseline(window, buffer, raw, (7,))
         buffer.receive(Block(7, raw))
+        clock.value += .01
         buffer.receive(Block(7, raw))
         result = window.finish_recording()
         assert result.status == "complete"
-        assert result.records == 2
+        assert result.records == 102
+        wait_collection(app, window)
+        assert window.waveform.mode == "review"
+        assert not window.collection_bar.start.isEnabled()
+        # A deliberate defer keeps null boundaries rather than inventing them.
+        window._defer_boundaries()
         assert window.collection_bar.subject.isEnabled()
         assert window.collection_bar.mark_valid.isEnabled()
         assert window.collection_bar.trial.text() == "pat002"
@@ -259,11 +293,14 @@ def test_closing_while_recording_finalises_meta(app, tmp_path):
         window.worker = SimpleNamespace(buffer=buffer)
         window.attach_recording_sink(buffer)
         window.input_source = "hardware"
-        buffer.receive(Block(7, raw))
+        for _ in range(300):
+            buffer.receive(Block(7, raw))
         plan = window.start_recording()
         buffer.receive(Block(7, raw))
         window.worker = None
         window.close()
+        wait_collection(app, window)
+        app.processEvents()
         meta = json.loads((plan.sample_dir / "meta.json").read_text(encoding="utf-8"))
         assert meta["recording_status"] in ("complete", "incomplete")
         assert meta["end_reason"] == "app_exit"
